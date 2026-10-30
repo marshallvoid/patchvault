@@ -10,8 +10,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests -v
@@ -25,10 +25,10 @@ jobs:
     outputs:
       tag: ${{ steps.semantic.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - id: semantic
@@ -49,8 +49,8 @@ jobs:
         os: [ubuntu-22.04, windows-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install -r requirements-build.txt
@@ -58,7 +58,7 @@ jobs:
         env:
           PATCHVAULT_RELEASES_URL: ${{ secrets.PATCHVAULT_RELEASES_URL }}
           PATCHVAULT_VERSION: ${{ needs.release.outputs.tag }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: PatchVault-${{ matrix.os }}
           path: dist/*.zip
@@ -68,3 +68,21 @@ jobs:
         run: gh release upload "${{ needs.release.outputs.tag }}" dist/*.zip --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  publish:
+    # The app follows the latest published release, so it must only see one with every zip.
+    needs: [release, build]
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft once every platform is attached
+        run: |
+          count=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets | length')
+          test "$count" -eq "$EXPECTED"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          EXPECTED: "4"

@@ -111,9 +111,11 @@ Pushing to `main` runs [semantic-release](https://semantic-release.gitbook.io/),
 | `feat!: ...` or a `BREAKING CHANGE:` footer | Major |
 | `docs:`, `chore:`, `refactor:`, `test:`, ... | None |
 
-When a release is published, the workflow builds Windows, macOS (Apple Silicon and Intel) and Linux
-zips and attaches them to it. The build can also be started by hand from the Actions tab, in which
-case the zips are stored as workflow artifacts.
+semantic-release creates a draft, the workflow builds Windows, macOS (Apple Silicon and Intel) and
+Linux zips and attaches them, then publishes the release once all four are there. The app therefore
+never sees a release without its zips. If a build fails, the draft stays unpublished. The build can
+also be started by hand from the Actions tab, in which case the zips are stored as workflow
+artifacts.
 
 Add `PATCHVAULT_RELEASES_URL` as a repository secret, see Configuration.
 
