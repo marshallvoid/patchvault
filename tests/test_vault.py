@@ -285,6 +285,18 @@ class AppUpdateTests(unittest.TestCase):
         with mock.patch.object(vault, "load_config", return_value={vault.VERSION_KEY: ""}):
             self.assertEqual(vault.app_version(), "dev")
 
+    def test_reports_the_outcome_of_a_check(self):
+        outcomes = {("v1.0.0", self.release("v1.0.1")): "available", ("v1.0.1", self.release("v1.0.1")): "current",
+                    ("v1.0.0", b"not json"): "error", ("", self.release("v1.0.1")): "unversioned"}
+        for (current, body), outcome in outcomes.items():
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = body
+            config = {vault.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
+            with tempfile.TemporaryDirectory() as folder, \
+                    mock.patch.object(vault, "load_config", return_value=config), \
+                    mock.patch.object(vault, "http_get", return_value=response):
+                self.assertEqual(vault.Vault(folder).check_app_update(), outcome)
+
     def test_parses_versions(self):
         self.assertEqual(vault.parse_version("v1.2.3"), (1, 2, 3))
         for text in ("", "dev", "v1.2", "1.2.3-beta"):

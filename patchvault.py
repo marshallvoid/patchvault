@@ -573,22 +573,31 @@ class Vault:
                 self.checking = False
 
     def check_app_update(self):
-        """Compare this build with the latest published release. Source runs have no version."""
+        """Compare this build with the latest release and return the outcome.
+
+        Source runs have no version, so they report "unversioned".
+        """
         config = load_config()
         current = parse_version(config.get(VERSION_KEY, ""))
         url = config.get("PATCHVAULT_RELEASES_URL")
         if current is None or not url:
-            return
+            return "unversioned"
         try:
             with http_get(url, {"Accept": "application/vnd.github+json"}) as response:
                 release = json.loads(response.read())
             latest = parse_version(release["tag_name"])
             page = https_or_empty(release.get("html_url"))
         except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException):
-            return
-        if latest and latest > current and page:
-            with self.lock:
-                self.app_update = {"tag": release["tag_name"], "url": page, "asset": self.pick_asset(release)}
+            return "error"
+        if latest is None:
+            return "error"
+        if latest <= current:
+            return "current"
+        if not page:
+            return "error"
+        with self.lock:
+            self.app_update = {"tag": release["tag_name"], "url": page, "asset": self.pick_asset(release)}
+        return "available"
 
     @staticmethod
     def pick_asset(release):
@@ -852,7 +861,6 @@ COLORS = {
     "line": "#3a3f46", "accent": "#e8894f", "accent_hover": "#f0a06d", "accent_ink": "#1a1208",
     "ok": "#6cc592", "bad": "#f2867e", "miss": "#b79cf0", "select": "#3d3229",
 }
-ALL_GENRES = "Tất cả thể loại"
 LIST_COLUMNS = (("game", "Game", 0), ("tags", "Thể loại", 250), ("version", "Phiên bản việt hóa", 155),
                 ("game_version", "Phiên bản game", 130), ("size", "Dung lượng", 100), ("status", "Trạng thái", 210))
 ROW_COLORS = {"update": "accent", "active": "accent", "ok": "ok", "error": "bad", "missing": "ink"}
@@ -952,6 +960,10 @@ class App:
         self.art_cache = {}
         self.art_signature = None
         self.genres = []
+        self.selected_genres = set()
+        self.genre_panel = None
+        self.genre_panel_anchor = None
+        self.app_check_result = None
         self.prompted_tag = None
         self.catalog_folders = []
         self.manager = None
@@ -1005,7 +1017,7 @@ class App:
         top.pack(fill="x")
         self.open_button = ttk.Button(top, text="Mở thư mục", command=self.open_folder)
         self.open_button.pack(side="right", padx=(6, 0))
-        self.check_button = ttk.Button(top, text="Kiểm tra cập nhật", command=self.check)
+        self.check_button = ttk.Button(top, text="Cập nhật catalog", command=self.check)
         self.check_button.pack(side="right", padx=(6, 0))
         self.app_update_button = ttk.Button(top, style="Accent.TButton", command=self.start_app_update)
         self.get_all_button = ttk.Button(top, command=self.get_all)
@@ -1022,10 +1034,10 @@ class App:
         ttk.Label(top, text="Tìm", style="Muted.TLabel").pack(side="left", padx=(0, 6))
         self.search_entry = ttk.Entry(top, textvariable=self.search, width=26)
         self.search_entry.pack(side="left")
-        self.genre = tk.StringVar(value=ALL_GENRES)
-        self.genre_box = ttk.Combobox(top, textvariable=self.genre, state="readonly", width=20)
-        self.genre_box.pack(side="left", padx=(8, 0))
-        self.genre_box.bind("<<ComboboxSelected>>", lambda _: self.genre_changed())
+        self.genre_button = ttk.Button(top, text="Thể loại", command=self.toggle_genre_panel)
+        self.genre_button.pack(side="left", padx=(8, 0))
+        self.root.bind("<Button-1>", self.close_genre_panel_on_click, add="+")
+        self.root.bind("<Configure>", self.close_genre_panel_on_move, add="+")
 
         body = ttk.Frame(self.root, padding=(14, 0, 14, 0))
         body.pack(fill="both", expand=True)
@@ -1084,6 +1096,8 @@ class App:
         self.footer = ttk.Label(foot, style="Muted.TLabel")
         self.footer.pack(side="left")
         ttk.Label(foot, text=app_version(), style="Muted.TLabel").pack(side="right")
+        self.app_check_button = ttk.Button(foot, text="Kiểm tra cập nhật app", command=self.check_app)
+        self.app_check_button.pack(side="right", padx=(0, 10))
 
     def _text_tags(self):
         c = COLORS
@@ -1105,15 +1119,70 @@ class App:
         for label in (self.name, self.state_label):
             label.configure(wraplength=event.width - 24)
 
-    def genre_changed(self):
-        self.genre_box.selection_clear()
+    def toggle_genre_panel(self):
+        if self.genre_panel:
+            self.close_genre_panel()
+            return
+        panel = tk.Toplevel(self.root, bg=COLORS["line"], bd=0)
+        panel.overrideredirect(True)
+        panel.transient(self.root)
+        panel.geometry(f"+{self.genre_button.winfo_rootx()}"
+                       f"+{self.genre_button.winfo_rooty() + self.genre_button.winfo_height() + 4}")
+        panel.bind("<Escape>", lambda _: self.close_genre_panel())
+        self.genre_panel = panel
+        self.genre_panel_anchor = self.root.geometry()
+        body = tk.Frame(panel, bg=COLORS["panel"], padx=10, pady=8)
+        body.pack(padx=1, pady=1)
+        for index, genre in enumerate(self.genres):
+            variable = tk.BooleanVar(value=genre in self.selected_genres)
+            tk.Checkbutton(body, text=genre, variable=variable, anchor="w", bd=0, highlightthickness=0, font=self.font,
+                           bg=COLORS["panel"], fg=COLORS["ink"], selectcolor=COLORS["field"],
+                           activebackground=COLORS["line"], activeforeground=COLORS["ink"],
+                           command=lambda g=genre, v=variable: self.toggle_genre(g, v.get())
+                           ).grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 10), pady=1)
+        ttk.Button(body, text="Bỏ chọn tất cả", command=self.clear_genres).grid(
+            row=len(self.genres) // 2 + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        panel.focus_set()
+
+    def close_genre_panel(self):
+        if self.genre_panel:
+            self.genre_panel.destroy()
+            self.genre_panel = None
+
+    def close_genre_panel_on_click(self, event):
+        if self.genre_panel and event.widget.winfo_toplevel() is self.root and event.widget is not self.genre_button:
+            self.close_genre_panel()
+
+    def close_genre_panel_on_move(self, event):
+        # The window also reports Configure when it stays put, so compare the real position.
+        if self.genre_panel and event.widget is self.root and self.root.geometry() != self.genre_panel_anchor:
+            self.close_genre_panel()
+
+    def toggle_genre(self, genre, selected):
+        if selected:
+            self.selected_genres.add(genre)
+        else:
+            self.selected_genres.discard(genre)
+        self.paint_genre_button()
         self.rebuild_rows()
+
+    def clear_genres(self):
+        self.selected_genres.clear()
+        self.close_genre_panel()
+        self.paint_genre_button()
+        self.rebuild_rows()
+
+    def paint_genre_button(self):
+        selected = sorted(self.selected_genres, key=str.lower)
+        text = "Thể loại" if not selected else f"Thể loại: {selected[0]}" if len(selected) == 1 \
+            else f"Thể loại ({len(selected)})"
+        self.genre_button.configure(text=text)
 
     def matches(self, item):
         query = self.search.get().strip().lower()
-        genre = self.genre.get()
         haystack = " ".join([item["name"], item["developer"], item["translator"], *item["tags"]]).lower()
-        return (not query or query in haystack) and (genre == ALL_GENRES or genre in item["tags"])
+        return (not query or query in haystack) and \
+            (not self.selected_genres or not self.selected_genres.isdisjoint(item["tags"]))
 
     def fit_list(self, event):
         self.list_canvas.itemconfigure(self.list_window, width=event.width)
@@ -1359,13 +1428,17 @@ class App:
         genres = sorted({tag for item in items.values() for tag in item["tags"]}, key=str.lower)
         if genres != self.genres:
             self.genres = genres
-            self.genre_box.configure(values=[ALL_GENRES, *genres])
+            self.close_genre_panel()
+            self.selected_genres &= set(genres)
+            self.paint_genre_button()
+            self.shown_ids = None
         self.paint_catalogs(snapshot)
         self.build_rows()
         self.paint_rows()
         self.preload_art()
         self.show_detail()
         self.paint_header(snapshot)
+        self.paint_app_check()
         self.paint_app_update(snapshot["app_update"], snapshot["app_update_job"])
         self.root.after(400, self.refresh)
 
@@ -1416,7 +1489,7 @@ class App:
         size = format_size(sum(item["size"] for item in missing)) if missing else ""
         self.get_all_button.configure(text=f"Tải tất cả ({size})" if size else "Tải tất cả")
         self.get_all_button.state(["!disabled"] if missing else ["disabled"])
-        self.check_button.configure(text="Đang kiểm tra…" if snapshot["checking"] else "Kiểm tra cập nhật")
+        self.check_button.configure(text="Đang cập nhật…" if snapshot["checking"] else "Cập nhật catalog")
         self.check_button.state(["disabled"] if snapshot["checking"] else ["!disabled"])
         if not self.vault.catalog:
             self.summary.configure(text="Chưa có catalog")
@@ -1425,6 +1498,35 @@ class App:
             self.footer.configure(text="Không cập nhật được catalog: " + snapshot["error"], style="Error.TLabel")
         else:
             self.footer.configure(text="Lưu vào: " + snapshot["dir"], style="Muted.TLabel")
+
+    def check_app(self):
+        self.app_check_button.state(["disabled"])
+        self.app_check_button.configure(text="Đang kiểm tra…")
+        threading.Thread(target=self.run_app_check, daemon=True).start()
+
+    def run_app_check(self):
+        self.app_check_result = self.vault.check_app_update()
+
+    def paint_app_check(self):
+        result = self.app_check_result
+        if result is None:
+            return
+        self.app_check_result = None
+        self.app_check_button.state(["!disabled"])
+        self.app_check_button.configure(text="Kiểm tra cập nhật app")
+        if result == "available":
+            # Asking by hand should prompt again, even after the user declined this version.
+            self.prompted_tag = None
+            return
+        title = "Kiểm tra cập nhật app"
+        if result == "current":
+            message = f"Bạn đang dùng bản mới nhất ({app_version()})."
+        elif result == "unversioned":
+            message = "Bản này không có số phiên bản nên không kiểm tra được."
+        else:
+            self.root.after_idle(messagebox.showerror, title, "Không kiểm tra được bản mới. Hãy thử lại sau.")
+            return
+        self.root.after_idle(messagebox.showinfo, title, message)
 
     def paint_app_update(self, update, job):
         self.app_update = update
@@ -1447,7 +1549,7 @@ class App:
         self.app_update_button.configure(text=label)
         self.app_update_button.state(["disabled"] if phase in ("downloading", "installing") else ["!disabled"])
         if not self.app_update_button.winfo_manager():
-            self.app_update_button.pack(side="left", padx=(8, 0), after=self.genre_box)
+            self.app_update_button.pack(side="left", padx=(8, 0), after=self.genre_button)
         if update["tag"] != self.prompted_tag:
             self.prompted_tag = update["tag"]
             self.root.after_idle(self.prompt_app_update)
