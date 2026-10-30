@@ -1,0 +1,13 @@
+# Local configuration
+.env
+
+# App data when running from source
+.data/
+
+# Build output
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

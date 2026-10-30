@@ -1,0 +1,3 @@
+certifi
+pillow
+pyinstaller>=6.22,<7

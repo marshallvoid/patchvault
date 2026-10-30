@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  release:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.semantic.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - id: semantic
+        run: npx --yes -p semantic-release@24 -p @semantic-release/exec@6 semantic-release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build:
+    needs: [test, release]
+    if: >-
+      !cancelled() && needs.test.result == 'success' &&
+      (needs.release.outputs.tag != '' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-build.txt
+      - run: python scripts/build.py
+        env:
+          PATCHVAULT_CATALOG_URL: ${{ secrets.PATCHVAULT_CATALOG_URL }}
+          PATCHVAULT_SIGNATURE_URL: ${{ secrets.PATCHVAULT_SIGNATURE_URL }}
+          PATCHVAULT_PUBLIC_KEY: ${{ secrets.PATCHVAULT_PUBLIC_KEY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PatchVault-${{ matrix.os }}
+          path: dist/*.zip
+          if-no-files-found: error
+      - if: needs.release.outputs.tag != ''
+        shell: bash
+        run: gh release upload "${{ needs.release.outputs.tag }}" dist/*.zip --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
