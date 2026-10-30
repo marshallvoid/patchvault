@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """PatchVault: download, track and repackage Vietnamese patches for Switch games.
 
-Needs Python 3.8+ with Tkinter; Pillow is optional and enables artwork. A catalog is only
-used when its signature is valid. URLs and the public key come from environment variables
-or a .env file (see .env.example).
+Needs Python 3.8+ with Tkinter; Pillow is optional and enables artwork. Catalogs are added
+from the app window, and each one keeps its own downloads, artwork and state.
 
 Every patch is repackaged as
-    downloaded/[VI] - <Game name>/[<game version>-unreviewed] [VI].zip
+    downloaded/<catalog>/[VI] - <Game name>/[<game version>-unreviewed] [VI].zip
 with a contents/<title id>/... layout (Deflate, level 9).
 
     python3 patchvault.py            open the app window
@@ -14,11 +13,11 @@ with a contents/<title id>/... layout (Deflate, level 9).
 """
 
 import argparse
-import base64
 import hashlib
 import http.client
 import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -59,24 +58,25 @@ INTERNAL_VERSION = "unreviewed"
 MISSING_VERSION = "miss"
 MAX_UNPACKED = 32 * 1024 ** 3
 MAX_IMAGE = 8 * 1024 * 1024
+MAX_CATALOG = 32 * 1024 * 1024
+CATALOGS_DIR = ".catalogs"
+MAX_UPDATE = 300 * 1024 * 1024
+PROGRAM_NAME = "PatchVault"
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 ART_KINDS = ("cover", "background")
 DOWNLOAD_DIR = "downloaded"
 SKIPPED_OUTSIDE = (".txt", ".md", ".url", ".pdf", ".htm", ".html")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
-CONFIG_KEYS = ("PATCHVAULT_CATALOG_URL", "PATCHVAULT_SIGNATURE_URL", "PATCHVAULT_PUBLIC_KEY")
+CONFIG_KEYS = ("PATCHVAULT_RELEASES_URL",)
+VERSION_KEY = "PATCHVAULT_VERSION"
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_SHA = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_GDRIVE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
 TITLE_ID = re.compile(r"^[0-9A-Fa-f]{16}$")
+ASSET_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-P256_P = 2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1
-P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
-P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
-P256_G = (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
-          0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)
 DISPLAY_VERSION = re.compile(r"v?\d+(?:\.\d+)*")
 
 
@@ -106,14 +106,6 @@ def load_config():
         values.update(parse_dotenv(Path(__file__).resolve().parent / ".env"))
     values.update({key: value for key, value in os.environ.items() if key in CONFIG_KEYS})
     return values
-
-
-def parse_public_key(text):
-    """Return (x, y) from a base64 P-256 SubjectPublicKeyInfo, the body of a PEM file."""
-    der = base64.b64decode("".join(text.split()), validate=True)
-    if len(der) != 91 or der[-65] != 4:
-        raise ValueError("public key không phải khoá P-256")
-    return int.from_bytes(der[-64:-32], "big"), int.from_bytes(der[-32:], "big")
 
 
 def https_or_empty(value):
@@ -174,7 +166,19 @@ def normalize(raw):
     }
 
 
+def fetch_catalog(url):
+    """Return the raw bytes and parsed items of the catalog at url."""
+    separator = "&" if "?" in url else "?"
+    with http_get(f"{url}{separator}t={int(time.time())}") as response:
+        raw = response.read(MAX_CATALOG + 1)
+    if len(raw) > MAX_CATALOG:
+        raise ValueError("catalog quá lớn")
+    return raw, parse_catalog(json.loads(raw))
+
+
 def parse_catalog(data):
+    if not isinstance(data, dict):
+        raise ValueError("file không phải catalog")
     items = []
     seen = set()
     for raw in data.get("mods") or []:
@@ -183,7 +187,7 @@ def parse_catalog(data):
             seen.add(entry["id"])
             items.append(entry)
     if not items:
-        raise ValueError("catalog không có mục hợp lệ")
+        raise ValueError("catalog không có game hợp lệ")
     return items
 
 
@@ -218,7 +222,84 @@ def http_get(url, headers=None, timeout=30):
     return urllib.request.urlopen(request, timeout=timeout, context=SSL_CONTEXT)
 
 
-def open_folder_in_system(path):
+def asset_name():
+    system = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+    machine = platform.machine().lower()
+    return f"{PROGRAM_NAME}-{system}-{'x86_64' if machine == 'amd64' else machine}.zip"
+
+
+def program_path():
+    """The file or .app that an update replaces."""
+    executable = Path(sys.executable).resolve()
+    return executable.parents[2] if sys.platform == "darwin" else executable
+
+
+def can_self_update(update):
+    return bool(getattr(sys, "frozen", False) and update.get("asset")
+                and os.access(program_path().parent, os.W_OK))
+
+
+def backup_path(program):
+    return program.with_name(program.name + ".old")
+
+
+def remove_path(path):
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def remove_old_program():
+    """A program cannot delete itself while running, so the next start removes the backup."""
+    if getattr(sys, "frozen", False):
+        try:
+            remove_path(backup_path(program_path()))
+        except OSError:
+            pass
+
+
+def extract_program(archive, target, name):
+    """Extract only the program from a release zip, leaving the data folders alone."""
+    if sys.platform == "darwin":
+        # ditto keeps the symlinks and signature inside the .app.
+        subprocess.run(["ditto", "-x", "-k", str(archive), str(target)], check=True)
+    else:
+        with zipfile.ZipFile(archive) as source:
+            for info in source.infolist():
+                parts = info.filename.split("/")
+                if parts[0] == name and ".." not in parts:
+                    source.extract(info, target)
+    extracted = target / name
+    if not extracted.exists():
+        raise RuntimeError(f"bản cập nhật không có {name}")
+    if sys.platform != "win32" and extracted.is_file():
+        extracted.chmod(0o755)
+    return extracted
+
+
+def swap_program(new, program):
+    """Move the running program aside, which every OS allows, then put the new one in place."""
+    backup = backup_path(program)
+    remove_path(backup)
+    os.replace(program, backup)
+    try:
+        shutil.move(str(new), str(program))
+    except OSError:
+        os.replace(backup, program)
+        raise
+
+
+def restart_program():
+    program = program_path()
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-n", str(program)])
+        return
+    # The new process must unpack its own bundle, not inherit this one's.
+    subprocess.Popen([str(program)], env={**system_env(), "PYINSTALLER_RESET_ENVIRONMENT": "1"})
+
+
+def open_in_system(path):
     if sys.platform == "win32":
         os.startfile(path)
     elif sys.platform == "darwin":
@@ -256,6 +337,16 @@ def art_file_name(item, kind):
     if suffix not in IMAGE_SUFFIXES:
         suffix = ".img"
     return f"{art_slug(item['name']) or item['id']}-{kind}{suffix}"
+
+
+def app_version():
+    return load_config().get(VERSION_KEY) or "dev"
+
+
+def parse_version(text):
+    """Return (major, minor, patch) from a tag like v1.2.3, or None for anything else."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text).strip())
+    return tuple(int(part) for part in match.groups()) if match else None
 
 
 def display_version(game_version):
@@ -355,82 +446,6 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
-def ec_add(first, second):
-    if first is None:
-        return second
-    if second is None:
-        return first
-    if first[0] == second[0]:
-        if (first[1] + second[1]) % P256_P == 0:
-            return None
-        slope = (3 * first[0] * first[0] - 3) * pow(2 * first[1], -1, P256_P)
-    else:
-        slope = (second[1] - first[1]) * pow(second[0] - first[0], -1, P256_P)
-    x = (slope * slope - first[0] - second[0]) % P256_P
-    return x, (slope * (first[0] - x) - first[1]) % P256_P
-
-
-def ec_multiply(scalar, point):
-    result = None
-    while scalar:
-        if scalar & 1:
-            result = ec_add(result, point)
-        point = ec_add(point, point)
-        scalar >>= 1
-    return result
-
-
-def parse_der_signature(der):
-    """Return (r, s) from a DER ECDSA signature, or None when it is malformed."""
-    if len(der) < 8 or der[0] != 0x30 or der[1] != len(der) - 2:
-        return None
-    position = 2
-    values = []
-    for _ in range(2):
-        if position + 2 > len(der) or der[position] != 0x02:
-            return None
-        length = der[position + 1]
-        position += 2
-        if not 1 <= length <= 33 or position + length > len(der):
-            return None
-        values.append(int.from_bytes(der[position:position + length], "big"))
-        position += length
-    return tuple(values) if position == len(der) else None
-
-
-def verify_ecdsa(message, der_signature, public_key):
-    """ECDSA P-256 with SHA-256. This only checks public data, so plain integers are fine."""
-    signature = parse_der_signature(der_signature)
-    if signature is None:
-        return False
-    r, s = signature
-    x, y = public_key
-    if not (1 <= r < P256_N and 1 <= s < P256_N):
-        return False
-    if (y * y - (x * x * x - 3 * x + P256_B)) % P256_P:
-        return False
-    digest = int.from_bytes(hashlib.sha256(message).digest(), "big")
-    inverse = pow(s, -1, P256_N)
-    point = ec_add(ec_multiply(digest * inverse % P256_N, P256_G),
-                   ec_multiply(r * inverse % P256_N, public_key))
-    return point is not None and point[0] % P256_N == r
-
-
-def catalog_key():
-    text = load_config().get("PATCHVAULT_PUBLIC_KEY")
-    if not text:
-        raise ValueError("thiếu cấu hình PATCHVAULT_PUBLIC_KEY")
-    return parse_public_key(text)
-
-
-def verified_catalog(raw, signature_text):
-    """Parse catalog bytes, but only after their detached signature has checked out."""
-    signature = base64.b64decode(signature_text.strip(), validate=True)
-    if not verify_ecdsa(raw, signature, catalog_key()):
-        raise ValueError("chữ ký catalog.sig không khớp, đã giữ nguyên catalog cũ")
-    return parse_catalog(json.loads(raw))
-
-
 class Cancelled(Exception):
     pass
 
@@ -438,25 +453,86 @@ class Cancelled(Exception):
 class Vault:
     def __init__(self, base):
         self.base = Path(base).resolve()
-        self.root = self.base / DOWNLOAD_DIR
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.catalogs_dir = self.base / CATALOGS_DIR
+        self.catalogs_dir.mkdir(parents=True, exist_ok=True)
+        self.registry_path = self.catalogs_dir / "index.json"
         self.parts = self.base / ".parts"
-        self.state_path = self.base / ".vault_state.json"
-        self.cache_path = self.base / ".catalog_cache.json"
-        self.signature_path = self.base / ".catalog_cache.sig"
         self.lock = threading.RLock()
-        self.items = []
-        self.state = self._load_json(self.state_path, {})
         self.jobs = {}
         self.cancels = {}
         self.queue = queue.Queue()
         self.checked_at = None
         self.check_error = None
         self.checking = False
+        self.app_update = None
+        self.app_update_job = None
+        registry = self._load_json(self.registry_path, {})
+        self.catalogs = registry.get("catalogs", [])
+        active = next((c for c in self.catalogs if c["folder"] == registry.get("active")), None)
+        self._use_catalog(active or (self.catalogs[0] if self.catalogs else None))
+
+    def _use_catalog(self, catalog):
+        """Point the vault at one catalog. Every catalog has its own files and state."""
+        self.catalog = catalog
+        folder = catalog["folder"] if catalog else "_none"
+        self.root = self.base / DOWNLOAD_DIR / folder
+        self.art_dir = self.base / "covers" / folder
+        self.art_index = self.catalogs_dir / f"{folder}.covers.json"
+        self.state_path = self.catalogs_dir / f"{folder}.state.json"
+        self.cache_path = self.catalogs_dir / f"{folder}.json"
+        self.state = self._load_json(self.state_path, {})
+        self.items = []
+        self.checked_at = None
+        self.check_error = None
         try:
-            self.items = verified_catalog(self.cache_path.read_bytes(), self.signature_path.read_text())
-        except (OSError, ValueError, AttributeError):
+            self.items = parse_catalog(json.loads(self.cache_path.read_bytes()))
+        except (OSError, ValueError):
             pass
+
+    def _save_registry(self):
+        active = self.catalog["folder"] if self.catalog else None
+        self._write_json(self.registry_path, {"active": active, "catalogs": self.catalogs})
+
+    def add_catalog(self, name, url):
+        """Add a catalog after confirming that the URL really serves one, then switch to it."""
+        url = url.strip()
+        if not url.startswith("https://"):
+            raise ValueError("URL phải bắt đầu bằng https://")
+        with self.lock:
+            if any(catalog["url"] == url for catalog in self.catalogs):
+                raise ValueError("catalog này đã có trong danh sách")
+        raw, _ = fetch_catalog(url)
+        name = name.strip() or urlsplit(url).hostname or "catalog"
+        with self.lock:
+            if self.busy():
+                raise ValueError("hãy đợi các file đang tải xong rồi thêm catalog")
+            taken = {catalog["folder"] for catalog in self.catalogs}
+            slug = art_slug(name) or "catalog"
+            folder, number = slug, 2
+            while folder in taken:
+                folder, number = f"{slug}-{number}", number + 1
+            catalog = {"name": name, "url": url, "folder": folder}
+            self.catalogs.append(catalog)
+            self._write_bytes(self.catalogs_dir / f"{folder}.json", raw)
+            self._use_catalog(catalog)
+            self.checked_at = time.time()
+            self._save_registry()
+        return catalog
+
+    def select_catalog(self, folder):
+        with self.lock:
+            catalog = next(c for c in self.catalogs if c["folder"] == folder)
+            if catalog is not self.catalog:
+                self._use_catalog(catalog)
+                self._save_registry()
+
+    def remove_catalog(self, folder):
+        """Drop a catalog from the list. Its downloads stay on disk."""
+        with self.lock:
+            self.catalogs = [catalog for catalog in self.catalogs if catalog["folder"] != folder]
+            if self.catalog and self.catalog["folder"] == folder:
+                self._use_catalog(self.catalogs[0] if self.catalogs else None)
+            self._save_registry()
 
     @staticmethod
     def _load_json(path, default):
@@ -475,33 +551,94 @@ class Vault:
 
     def check(self):
         with self.lock:
-            if self.checking:
+            if self.checking or not self.catalog:
                 return
             self.checking = True
+            catalog = self.catalog
         try:
-            config = load_config()
-            catalog_url = config.get("PATCHVAULT_CATALOG_URL")
-            signature_url = config.get("PATCHVAULT_SIGNATURE_URL")
-            if not (catalog_url and signature_url):
-                raise ValueError("thiếu cấu hình PATCHVAULT_CATALOG_URL hoặc PATCHVAULT_SIGNATURE_URL")
-            stamp = int(time.time())
-            with http_get(f"{catalog_url}?t={stamp}") as response:
-                raw = response.read()
-            with http_get(f"{signature_url}?t={stamp}") as response:
-                signature_raw = response.read()
-            items = verified_catalog(raw, signature_raw.decode("ascii"))
-            self._write_bytes(self.cache_path, raw)
-            self._write_bytes(self.signature_path, signature_raw)
+            raw, items = fetch_catalog(catalog["url"])
             with self.lock:
-                self.items = items
-                self.check_error = None
-                self.checked_at = time.time()
-        except (OSError, ValueError, AttributeError, http.client.HTTPException) as error:
+                # The user may have switched catalogs while this one was loading.
+                if self.catalog is catalog:
+                    self._write_bytes(self.cache_path, raw)
+                    self.items = items
+                    self.check_error = None
+                    self.checked_at = time.time()
+        except (OSError, ValueError, http.client.HTTPException) as error:
             with self.lock:
-                self.check_error = str(error) or type(error).__name__
+                if self.catalog is catalog:
+                    self.check_error = str(error) or type(error).__name__
         finally:
             with self.lock:
                 self.checking = False
+
+    def check_app_update(self):
+        """Compare this build with the latest published release. Source runs have no version."""
+        config = load_config()
+        current = parse_version(config.get(VERSION_KEY, ""))
+        url = config.get("PATCHVAULT_RELEASES_URL")
+        if current is None or not url:
+            return
+        try:
+            with http_get(url, {"Accept": "application/vnd.github+json"}) as response:
+                release = json.loads(response.read())
+            latest = parse_version(release["tag_name"])
+            page = https_or_empty(release.get("html_url"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException):
+            return
+        if latest and latest > current and page:
+            with self.lock:
+                self.app_update = {"tag": release["tag_name"], "url": page, "asset": self.pick_asset(release)}
+
+    @staticmethod
+    def pick_asset(release):
+        for asset in release.get("assets") or []:
+            if isinstance(asset, dict) and asset.get("name") == asset_name():
+                url = asset.get("browser_download_url")
+                size = asset.get("size")
+                digest = asset.get("digest")
+                valid = isinstance(url, str) and url.startswith("https://github.com/") \
+                    and isinstance(size, int) and 0 < size <= MAX_UPDATE \
+                    and isinstance(digest, str) and ASSET_DIGEST.match(digest)
+                return {"url": url, "size": size, "sha256": digest[len("sha256:"):]} if valid else None
+        return None
+
+    def set_update_job(self, **fields):
+        with self.lock:
+            self.app_update_job = {**(self.app_update_job or {}), **fields}
+
+    def download_update(self, asset, path):
+        digest = hashlib.sha256()
+        done = 0
+        with http_get(asset["url"]) as response, open(path, "wb") as handle:
+            for block in iter(lambda: response.read(CHUNK), b""):
+                done += len(block)
+                if done > asset["size"]:
+                    raise RuntimeError("file lớn hơn kích thước trong release")
+                digest.update(block)
+                handle.write(block)
+                self.set_update_job(done=done)
+        if done != asset["size"] or digest.hexdigest() != asset["sha256"]:
+            raise RuntimeError("bản cập nhật không khớp SHA-256 của release")
+
+    def install_app_update(self, update):
+        asset = update["asset"]
+        program = program_path()
+        work = self.parts / "app-update"
+        self.set_update_job(phase="downloading", done=0, total=asset["size"], message="")
+        try:
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True)
+            archive = work / "update.zip"
+            self.download_update(asset, archive)
+            self.set_update_job(phase="installing")
+            swap_program(extract_program(archive, work / "extracted", program.name), program)
+            self.set_update_job(phase="done")
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, subprocess.SubprocessError,
+                http.client.HTTPException) as error:
+            self.set_update_job(phase="error", message=str(error) or type(error).__name__)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     def local_path(self, record):
         path = (self.root / record["file"]).resolve()
@@ -530,6 +667,10 @@ class Vault:
                 "checking": self.checking,
                 "error": self.check_error,
                 "dir": str(self.root),
+                "catalogs": list(self.catalogs),
+                "active": self.catalog["folder"] if self.catalog else None,
+                "app_update": self.app_update,
+                "app_update_job": self.app_update_job,
             }
 
     def enqueue(self, ids):
@@ -547,6 +688,10 @@ class Vault:
             event = self.cancels.get(entry_id)
         if event:
             event.set()
+
+    def busy(self):
+        with self.lock:
+            return any(job["phase"] != "error" for job in self.jobs.values())
 
     def snapshot_jobs(self):
         with self.lock:
@@ -790,7 +935,7 @@ class App:
     def __init__(self, vault):
         self.vault = vault
         self.root = tk.Tk(className="PatchVault")
-        self.root.title("PatchVault")
+        self.root.title(f"PatchVault {app_version()}")
         self.root.geometry("1640x900")
         self.root.minsize(1320, 620)
         self.root.configure(bg=COLORS["bg"])
@@ -807,8 +952,9 @@ class App:
         self.art_cache = {}
         self.art_signature = None
         self.genres = []
-        self.art_dir = vault.base / "covers"
-        self.art_index = vault.base / ".covers_index.json"
+        self.prompted_tag = None
+        self.catalog_folders = []
+        self.manager = None
         self._style()
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -861,11 +1007,18 @@ class App:
         self.open_button.pack(side="right", padx=(6, 0))
         self.check_button = ttk.Button(top, text="Kiểm tra cập nhật", command=self.check)
         self.check_button.pack(side="right", padx=(6, 0))
+        self.app_update_button = ttk.Button(top, style="Accent.TButton", command=self.start_app_update)
         self.get_all_button = ttk.Button(top, command=self.get_all)
         self.get_all_button.pack(side="right", padx=(6, 0))
         self.update_all_button = ttk.Button(top, style="Accent.TButton", command=self.update_all)
         self.search = tk.StringVar()
         self.search.trace_add("write", lambda *_: self.rebuild_rows())
+        ttk.Label(top, text="Catalog", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        self.catalog_box = ttk.Combobox(top, state="readonly", width=22)
+        self.catalog_box.pack(side="left")
+        self.catalog_box.bind("<<ComboboxSelected>>", lambda _: self.catalog_changed())
+        self.manage_button = ttk.Button(top, text="Quản lý", command=self.open_manager)
+        self.manage_button.pack(side="left", padx=(6, 16))
         ttk.Label(top, text="Tìm", style="Muted.TLabel").pack(side="left", padx=(0, 6))
         self.search_entry = ttk.Entry(top, textvariable=self.search, width=26)
         self.search_entry.pack(side="left")
@@ -930,6 +1083,7 @@ class App:
         foot.pack(fill="x")
         self.footer = ttk.Label(foot, style="Muted.TLabel")
         self.footer.pack(side="left")
+        ttk.Label(foot, text=app_version(), style="Muted.TLabel").pack(side="right")
 
     def _text_tags(self):
         c = COLORS
@@ -996,7 +1150,7 @@ class App:
             self.list_canvas.yview_moveto((frame.winfo_y() + frame.winfo_height() - visible) / total)
 
     def build_rows(self):
-        signature = tuple((item["id"], tuple(item["tags"])) for item in self.items.values())
+        signature = (self.vault.root, *((item["id"], tuple(item["tags"])) for item in self.items.values()))
         if signature == self.row_signature:
             return
         self.row_signature = signature
@@ -1135,7 +1289,7 @@ class App:
             self.progress.pack_forget()
 
     def show_art(self, item):
-        image = self.art_cache.get(item["id"])
+        image = self.art_cache.get((self.vault.root.name, item["id"]))
         if image is None or self.art_id == item["id"]:
             return
         self.art_id = item["id"]
@@ -1145,43 +1299,45 @@ class App:
 
     def preload_art(self):
         """Fetch and compose every banner in the background so selecting a game is instant."""
+        vault = self.vault
         items = [item for item in self.items.values() if item["cover"] or item["background"]]
-        signature = tuple((item["cover"], item["background"]) for item in items)
+        signature = (vault.root.name, *((item["cover"], item["background"]) for item in items))
         if Image is None or signature == self.art_signature:
             return
         self.art_signature = signature
-        self.art_dir.mkdir(exist_ok=True)
+        art_dir = vault.art_dir
+        art_dir.mkdir(parents=True, exist_ok=True)
         files = {art_file_name(item, kind): item[kind] for item in items for kind in ART_KINDS if item[kind]}
-        known = self.vault._load_json(self.art_index, {})
-        for old in self.art_dir.iterdir():
+        known = vault._load_json(vault.art_index, {})
+        for old in art_dir.iterdir():
             if old.name not in files or known.get(old.name) != files[old.name]:
                 old.unlink(missing_ok=True)
-        self.vault._write_json(self.art_index, files)
+        vault._write_json(vault.art_index, files)
         pending = queue.Queue()
         for item in items:
             pending.put(item)
         for _ in range(ART_WORKERS):
-            threading.Thread(target=self.art_worker, args=(pending,), daemon=True).start()
+            threading.Thread(target=self.art_worker, args=(pending, art_dir), daemon=True).start()
 
-    def art_worker(self, pending):
+    def art_worker(self, pending, art_dir):
         while True:
             try:
                 item = pending.get_nowait()
             except queue.Empty:
                 return
-            cover = self.load_image(item, "cover")
-            background = self.load_image(item, "background")
+            cover = self.load_image(item, "cover", art_dir)
+            background = self.load_image(item, "background", art_dir)
             if cover or background:
                 try:
-                    self.art_cache[item["id"]] = compose_banner(cover, background, self.ART_SIZE)
+                    self.art_cache[(art_dir.name, item["id"])] = compose_banner(cover, background, self.ART_SIZE)
                 except Exception:
                     pass
 
-    def load_image(self, item, kind):
+    def load_image(self, item, kind, art_dir):
         url = item[kind]
         if not url:
             return None
-        path = self.art_dir / art_file_name(item, kind)
+        path = art_dir / art_file_name(item, kind)
         try:
             if not path.is_file():
                 with http_get(url) as response:
@@ -1204,12 +1360,41 @@ class App:
         if genres != self.genres:
             self.genres = genres
             self.genre_box.configure(values=[ALL_GENRES, *genres])
+        self.paint_catalogs(snapshot)
         self.build_rows()
         self.paint_rows()
         self.preload_art()
         self.show_detail()
         self.paint_header(snapshot)
+        self.paint_app_update(snapshot["app_update"], snapshot["app_update_job"])
         self.root.after(400, self.refresh)
+
+    def paint_catalogs(self, snapshot):
+        folders = [catalog["folder"] for catalog in snapshot["catalogs"]]
+        if folders != self.catalog_folders:
+            self.catalog_folders = folders
+            self.catalog_box.configure(values=[catalog["name"] for catalog in snapshot["catalogs"]])
+        if snapshot["active"] in folders:
+            self.catalog_box.current(folders.index(snapshot["active"]))
+        else:
+            self.catalog_box.set("")
+
+    def catalog_changed(self):
+        self.catalog_box.selection_clear()
+        index = self.catalog_box.current()
+        if index < 0:
+            return
+        if self.vault.busy():
+            messagebox.showinfo("Đang tải", "Hãy đợi các file đang tải xong rồi đổi catalog.", parent=self.root)
+            return
+        self.vault.select_catalog(self.catalog_folders[index])
+        self.check()
+
+    def open_manager(self):
+        if self.manager and self.manager.window.winfo_exists():
+            self.manager.window.lift()
+        else:
+            self.manager = CatalogManager(self)
 
     def paint_header(self, snapshot):
         idle = [item for item in self.items.values() if not item["job"]]
@@ -1233,10 +1418,61 @@ class App:
         self.get_all_button.state(["!disabled"] if missing else ["disabled"])
         self.check_button.configure(text="Đang kiểm tra…" if snapshot["checking"] else "Kiểm tra cập nhật")
         self.check_button.state(["disabled"] if snapshot["checking"] else ["!disabled"])
-        if snapshot["error"]:
+        if not self.vault.catalog:
+            self.summary.configure(text="Chưa có catalog")
+            self.footer.configure(text="Bấm Quản lý để thêm catalog đầu tiên", style="Muted.TLabel")
+        elif snapshot["error"]:
             self.footer.configure(text="Không cập nhật được catalog: " + snapshot["error"], style="Error.TLabel")
         else:
             self.footer.configure(text="Lưu vào: " + snapshot["dir"], style="Muted.TLabel")
+
+    def paint_app_update(self, update, job):
+        self.app_update = update
+        if not update:
+            return
+        phase = job["phase"] if job else None
+        if phase == "done":
+            restart_program()
+            self.root.destroy()
+            return
+        if phase == "error":
+            self.vault.app_update_job = None
+            self.root.after_idle(self.report_update_error, job["message"])
+        if phase == "downloading":
+            label = f"Đang cập nhật {100 * job['done'] // job['total']}%"
+        elif phase == "installing":
+            label = "Đang cài bản mới"
+        else:
+            label = f"Có bản mới {update['tag']}"
+        self.app_update_button.configure(text=label)
+        self.app_update_button.state(["disabled"] if phase in ("downloading", "installing") else ["!disabled"])
+        if not self.app_update_button.winfo_manager():
+            self.app_update_button.pack(side="left", padx=(8, 0), after=self.genre_box)
+        if update["tag"] != self.prompted_tag:
+            self.prompted_tag = update["tag"]
+            self.root.after_idle(self.prompt_app_update)
+
+    def prompt_app_update(self):
+        action = "Tải về và cập nhật ngay? Ứng dụng sẽ tự khởi động lại." if can_self_update(self.app_update) \
+            else "Mở trang tải về để cập nhật?"
+        if messagebox.askyesno("Có phiên bản mới", f"Đã có PatchVault {self.app_update['tag']}. {action}",
+                               parent=self.root):
+            self.start_app_update()
+
+    def start_app_update(self):
+        update = self.app_update
+        if not can_self_update(update):
+            open_in_system(update["url"])
+        elif any(job["phase"] != "error" for job in self.vault.snapshot_jobs()):
+            messagebox.showinfo("Đang tải", "Hãy đợi các file đang tải xong rồi cập nhật ứng dụng.", parent=self.root)
+        else:
+            self.vault.set_update_job(phase="queued", done=0, total=1)
+            threading.Thread(target=self.vault.install_app_update, args=(update,), daemon=True).start()
+
+    def report_update_error(self, message):
+        text = f"Không cập nhật được: {message}\n\nMở trang tải về để cập nhật thủ công?"
+        if messagebox.askyesno("Lỗi cập nhật", text, icon="warning", parent=self.root):
+            open_in_system(self.app_update["url"])
 
     def act(self):
         item = self.items.get(self.detail_id)
@@ -1259,10 +1495,13 @@ class App:
         threading.Thread(target=self.vault.check, daemon=True).start()
 
     def open_folder(self):
-        open_folder_in_system(self.vault.root)
+        self.vault.root.mkdir(parents=True, exist_ok=True)
+        open_in_system(self.vault.root)
 
     def close(self):
         active = [job for job in self.vault.snapshot_jobs() if job["phase"] != "error"]
+        if self.vault.app_update_job:
+            active.append(self.vault.app_update_job)
         if active and not messagebox.askyesno(
                 "Đang tải", "Vẫn còn file đang tải. Thoát bây giờ? Lần sau có thể tải tiếp từ phần đã tải."):
             return
@@ -1270,6 +1509,97 @@ class App:
 
     def run(self):
         self.root.mainloop()
+
+
+class CatalogManager:
+    """Window that adds and removes catalogs."""
+
+    def __init__(self, app):
+        self.app = app
+        self.vault = app.vault
+        self.result = None
+        self.window = tk.Toplevel(app.root, bg=COLORS["bg"])
+        self.window.title("Quản lý catalog")
+        self.window.geometry("640x400")
+        self.window.minsize(520, 340)
+        self.window.transient(app.root)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.listbox = tk.Listbox(frame, bg=COLORS["field"], fg=COLORS["ink"], bd=0, highlightthickness=0,
+                                  selectbackground=COLORS["select"], selectforeground=COLORS["ink"],
+                                  activestyle="none", font=app.font)
+        self.listbox.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.listbox.bind("<<ListboxSelect>>", lambda _: self.paint_buttons())
+        self.remove_button = ttk.Button(frame, text="Xoá khỏi danh sách", command=self.remove)
+        self.remove_button.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 12))
+        self.name = tk.StringVar()
+        self.url = tk.StringVar()
+        ttk.Label(frame, text="Tên", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(frame, textvariable=self.name).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Label(frame, text="URL", style="Muted.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        url_entry = ttk.Entry(frame, textvariable=self.url)
+        url_entry.grid(row=3, column=1, sticky="ew", pady=3)
+        url_entry.bind("<Return>", lambda _: self.add())
+        self.status = ttk.Label(frame, style="Muted.TLabel", wraplength=460, justify="left")
+        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_button = ttk.Button(frame, text="Thêm catalog", style="Accent.TButton", command=self.add)
+        self.add_button.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        self.fill_list()
+        url_entry.focus_set()
+
+    def fill_list(self):
+        self.listbox.delete(0, "end")
+        for catalog in self.vault.catalogs:
+            self.listbox.insert("end", f"{catalog['name']}  ·  {catalog['url']}")
+        self.paint_buttons()
+
+    def paint_buttons(self):
+        self.remove_button.state(["!disabled"] if self.listbox.curselection() else ["disabled"])
+
+    def add(self):
+        if self.result is not None or "disabled" in self.add_button.state():
+            return
+        self.add_button.state(["disabled"])
+        self.status.configure(text="Đang đọc catalog…", style="Muted.TLabel")
+        threading.Thread(target=self.run_add, args=(self.name.get(), self.url.get()), daemon=True).start()
+        self.window.after(150, self.wait_for_add)
+
+    def run_add(self, name, url):
+        try:
+            catalog = self.vault.add_catalog(name, url)
+            self.result = ("ok", f"Đã thêm {catalog['name']}.")
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            self.result = ("error", str(error) or type(error).__name__)
+
+    def wait_for_add(self):
+        if not self.window.winfo_exists():
+            return
+        if self.result is None:
+            self.window.after(150, self.wait_for_add)
+            return
+        state, message = self.result
+        self.result = None
+        self.add_button.state(["!disabled"])
+        self.status.configure(text=message, style="Muted.TLabel" if state == "ok" else "Error.TLabel")
+        if state == "ok":
+            self.name.set("")
+            self.url.set("")
+            self.fill_list()
+
+    def remove(self):
+        selected = self.listbox.curselection()
+        if not selected:
+            return
+        catalog = self.vault.catalogs[selected[0]]
+        if self.vault.busy() and catalog is self.vault.catalog:
+            self.status.configure(text="Hãy đợi các file đang tải xong.", style="Error.TLabel")
+            return
+        if messagebox.askyesno("Xoá catalog", f"Xoá {catalog['name']} khỏi danh sách? File đã tải vẫn được giữ lại.",
+                               parent=self.window):
+            self.vault.remove_catalog(catalog["folder"])
+            self.fill_list()
 
 
 def compose_banner(cover, background, size):
@@ -1291,11 +1621,18 @@ def compose_banner(cover, background, size):
 def periodic_check(vault):
     while True:
         vault.check()
+        vault.check_app_update()
         time.sleep(CHECK_RETRY if vault.check_error else CHECK_INTERVAL)
 
 
 def run_check(vault):
     vault.check()
+    vault.check_app_update()
+    if vault.app_update:
+        print(f"Có phiên bản PatchVault mới: {vault.app_update['tag']} ({vault.app_update['url']})")
+    if not vault.catalog:
+        print("Chưa có catalog. Hãy mở ứng dụng để thêm catalog.")
+        return 0
     if vault.check_error:
         print(f"Lỗi kiểm tra catalog: {vault.check_error}", file=sys.stderr)
         return 1
@@ -1304,7 +1641,8 @@ def run_check(vault):
     for entry in updates:
         old = vault.state[entry["id"]].get("version") or "?"
         print(f"Có cập nhật: {entry['name']} ({old} -> {entry['version'] or '?'})")
-    print(f"{len(updates)} bản cập nhật, {missing} game chưa tải, tổng {len(vault.items)} game.")
+    print(f"{vault.catalog['name']}: {len(updates)} bản cập nhật, {missing} game chưa tải, "
+          f"tổng {len(vault.items)} game.")
     return 0
 
 
@@ -1317,6 +1655,7 @@ def main():
     vault = Vault(args.dir)
     if args.check:
         return run_check(vault)
+    remove_old_program()
     if tk is None:
         print("Máy này chưa có Tkinter. Hãy cài gói tk (Arch) hoặc python3-tk (Debian/Ubuntu).", file=sys.stderr)
         return 1
@@ -1324,7 +1663,10 @@ def main():
     threading.Thread(target=periodic_check, args=(vault,), daemon=True).start()
     for _ in range(WORKERS):
         threading.Thread(target=vault.worker, daemon=True).start()
-    App(vault).run()
+    app = App(vault)
+    if not vault.catalogs:
+        app.root.after(300, app.open_manager)
+    app.run()
     return 0
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build PatchVault for the current OS into dist/<package>/ and dist/<package>.zip."""
 
-import platform
+import os
 import shutil
 import subprocess
 import sys
@@ -15,16 +15,10 @@ sys.path.insert(0, str(ROOT))
 
 import patchvault  # noqa: E402
 
-NAME = "PatchVault"
+NAME = patchvault.PROGRAM_NAME
 DIST = ROOT / "dist"
 WORK = DIST / "work"
 DATA_FOLDERS = ("downloaded", "covers")
-
-
-def package_name():
-    system = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
-    machine = platform.machine().lower()
-    return f"{NAME}-{system}-{'x86_64' if machine == 'amd64' else machine}"
 
 
 def write_build_config():
@@ -33,8 +27,8 @@ def write_build_config():
     missing = [key for key in patchvault.CONFIG_KEYS if not config.get(key)]
     if missing:
         sys.exit(f"Missing configuration: {', '.join(missing)} (see .env.example)")
-    patchvault.parse_public_key(config["PATCHVAULT_PUBLIC_KEY"])
     values = {key: config[key] for key in patchvault.CONFIG_KEYS}
+    values[patchvault.VERSION_KEY] = os.environ.get(patchvault.VERSION_KEY, "")
     generated = WORK / "generated"
     generated.mkdir(parents=True)
     (generated / "patchvault_build_config.py").write_text(f"VALUES = {values!r}\n", encoding="utf-8")
@@ -82,7 +76,7 @@ def archive(source):
 def main():
     shutil.rmtree(DIST, ignore_errors=True)
     compile_app(write_build_config())
-    target = archive(stage(package_name()))
+    target = archive(stage(Path(patchvault.asset_name()).stem))
     shutil.rmtree(WORK)
     print(target)
 

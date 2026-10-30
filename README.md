@@ -1,28 +1,33 @@
 # PatchVault
 
 A desktop app that downloads, tracks and repackages Vietnamese translation patches for Nintendo
-Switch games from a signed remote catalog.
+Switch games from remote catalogs that you add yourself.
 
 ## Features
 
-- Uses a catalog only when its detached ECDSA P-256 signature is valid.
+- Add several catalogs by URL and switch between them from the app.
 - Verifies the SHA-256 of every download, resumes interrupted transfers and falls back to mirrors.
 - Detects updates, even after a patch has been repackaged.
+- Updates itself from GitHub releases.
 - Repackages every patch into one consistent layout:
 
 ```
 downloaded/
-└── [VI] - <Game name>/
-    └── [<game version>-unreviewed] [VI].zip
-        └── contents/<title id>/...
+└── <catalog>/
+    └── [VI] - <Game name>/
+        └── [<game version>-unreviewed] [VI].zip
+            └── contents/<title id>/...
 ```
 
 Games with no version in the catalog use `miss`. Files outside the title ID folder, such as
 instructions, are not kept in the new zip.
 
+Catalogs are not signed, so a catalog decides what you download. Only add catalogs you trust. No
+catalog is included with the app.
+
 ## Install
 
-Download the zip for your platform from Releases and extract it anywhere. It contains:
+Download the zip for your platform from [Releases](../../releases) and extract it anywhere. It contains:
 
 ```
 PatchVault          # .exe on Windows, .app on macOS
@@ -45,25 +50,42 @@ keep the data next to the app, clear the quarantine flag:
 xattr -dr com.apple.quarantine PatchVault.app
 ```
 
+## Catalogs
+
+Choose **Quản lý** in the app and enter a name and an HTTPS URL. Each catalog keeps its own
+downloads, artwork and state, so two catalogs can list the same game. Removing a catalog keeps its
+downloaded files. A catalog is a JSON file:
+
+```json
+{
+  "mods": [
+    {
+      "id": "game",
+      "title_id": "0100000000000000",
+      "name": "Game name",
+      "game_version": "1.0.0",
+      "mod_version": "v1",
+      "sha256": "<SHA-256 of the zip>",
+      "size": 12345,
+      "url": "https://example.com/game.zip"
+    }
+  ]
+}
+```
+
+Optional fields are `tagline`, `developer`, `release`, `translator`, `tags`, `description`,
+`highlights`, `done`, `kept`, `changelog`, `credit`, `cover`, `background` and `mirrors`.
+
 ## Configuration
 
-The catalog location and signing key are not stored in this repository.
-
-```bash
-cp .env.example .env
-```
+Local builds read `.env`, see `.env.example`. Real environment variables override it.
 
 | Variable | Description |
 |---|---|
-| `PATCHVAULT_CATALOG_URL` | HTTPS URL of `catalog.json` |
-| `PATCHVAULT_SIGNATURE_URL` | HTTPS URL of the catalog signature |
-| `PATCHVAULT_PUBLIC_KEY` | P-256 public key, the base64 body of a PEM file on one line |
+| `PATCHVAULT_RELEASES_URL` | GitHub API URL of the latest release, for app update checks |
 
-Real environment variables override `.env`. Packaged builds embed these values at build
-time. Download URLs come from the catalog itself.
-
-When running from source, downloads, covers and caches live in `.data/` at the project root, which
-is ignored by git and survives `make clean`.
+The value is embedded at build time. When running from source, downloads, covers and caches live
+in `.data/` at the project root, which is ignored by git and survives `make clean`.
 
 ## Development
 
@@ -90,6 +112,15 @@ Pushing to `main` runs [semantic-release](https://semantic-release.gitbook.io/),
 | `docs:`, `chore:`, `refactor:`, `test:`, ... | None |
 
 When a release is published, the workflow builds Windows, macOS (Apple Silicon and Intel) and Linux
-zips and attaches them to it. Add `PATCHVAULT_CATALOG_URL`, `PATCHVAULT_SIGNATURE_URL` and
-`PATCHVAULT_PUBLIC_KEY` as repository secrets first. The build can also be started by hand from the
-Actions tab, in which case the zips are stored as workflow artifacts.
+zips and attaches them to it. The build can also be started by hand from the Actions tab, in which
+case the zips are stored as workflow artifacts.
+
+Add `PATCHVAULT_RELEASES_URL` as a repository secret, see Configuration.
+
+## Updates
+
+Packaged builds check the latest GitHub release at startup and every 30 minutes. When the user
+accepts an update, the app downloads the zip for its platform, verifies it against the SHA-256
+reported by GitHub, replaces only the program and restarts. `downloaded/` and `covers/` are not
+touched. If the program folder is not writable, or the release has no zip for the platform, the app
+opens the release page instead. Builds without a version, such as local ones, skip this check.

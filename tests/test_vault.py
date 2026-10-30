@@ -1,4 +1,6 @@
-import base64
+import hashlib
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -12,24 +14,6 @@ sys.dont_write_bytecode = True
 import patchvault as vault  # noqa: E402
 
 TITLE = "0100BA4026E94000"
-# RFC 6979 appendix A.2.5: P-256, SHA-256, message "sample".
-RFC_KEY = (0x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6,
-           0x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299)
-RFC_R = 0xEFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716
-RFC_S = 0xF7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8
-
-
-def der_integer(value):
-    data = value.to_bytes(33, "big").lstrip(b"\0") or b"\0"
-    if data[0] & 0x80:
-        data = b"\0" + data
-    return bytes([2, len(data)]) + data
-
-
-def der_signature(r, s):
-    body = der_integer(r) + der_integer(s)
-    return bytes([0x30, len(body)]) + body
-
 
 def entry(**overrides):
     fields = {"id": "game", "sha256": "0" * 64, "size": 1, "url": "https://example.com/a.zip",
@@ -37,52 +21,7 @@ def entry(**overrides):
     return {**fields, **overrides}
 
 
-class SignatureTests(unittest.TestCase):
-    def test_rfc6979_vector(self):
-        signature = der_signature(RFC_R, RFC_S)
-        self.assertTrue(vault.verify_ecdsa(b"sample", signature, RFC_KEY))
-
-    def test_rejects_changed_message_or_signature(self):
-        self.assertFalse(vault.verify_ecdsa(b"Sample", der_signature(RFC_R, RFC_S), RFC_KEY))
-        self.assertFalse(vault.verify_ecdsa(b"sample", der_signature(RFC_R, RFC_S + 1), RFC_KEY))
-
-    def test_rejects_malformed_signatures(self):
-        good = der_signature(RFC_R, RFC_S)
-        for bad in (b"", b"\x30\x00", good[:40], good + b"\0", der_signature(0, 1), der_signature(1, vault.P256_N)):
-            self.assertFalse(vault.verify_ecdsa(b"sample", bad, RFC_KEY))
-
-    def test_rejects_key_off_curve(self):
-        self.assertFalse(vault.verify_ecdsa(b"sample", der_signature(RFC_R, RFC_S), (RFC_KEY[0], RFC_KEY[1] + 1)))
-
-    def test_catalog_is_not_parsed_without_a_valid_signature(self):
-        signature = base64.b64encode(der_signature(RFC_R, RFC_S)).decode()
-        with mock.patch.object(vault, "catalog_key", return_value=RFC_KEY), self.assertRaises(ValueError):
-            vault.verified_catalog(b'{"mods": []}', signature)
-
-    def test_catalog_signed_with_the_configured_key_is_parsed(self):
-        signature = base64.b64encode(der_signature(RFC_R, RFC_S)).decode()
-        with mock.patch.object(vault, "catalog_key", return_value=RFC_KEY), \
-                mock.patch.object(vault, "parse_catalog", return_value=["item"]) as parse, \
-                mock.patch.object(vault.json, "loads", return_value={}):
-            self.assertEqual(vault.verified_catalog(b"sample", signature), ["item"])
-        parse.assert_called_once()
-
-
 class ConfigTests(unittest.TestCase):
-    SPKI = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
-
-    def public_key(self):
-        point = b"\x04" + RFC_KEY[0].to_bytes(32, "big") + RFC_KEY[1].to_bytes(32, "big")
-        return base64.b64encode(self.SPKI + point).decode()
-
-    def test_parses_a_public_key(self):
-        self.assertEqual(vault.parse_public_key(self.public_key()), RFC_KEY)
-
-    def test_rejects_other_keys(self):
-        for text in ("", "AAAA", "not base64!"):
-            with self.subTest(text), self.assertRaises(ValueError):
-                vault.parse_public_key(text)
-
     def test_reads_dotenv_files(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / ".env"
@@ -90,21 +29,120 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(vault.parse_dotenv(path), {"A": "1", "B": "two=2", "C": ""})
 
     def test_environment_overrides_dotenv(self):
-        with mock.patch.object(vault, "parse_dotenv", return_value={"PATCHVAULT_CATALOG_URL": "file"}), \
-                mock.patch.dict(vault.os.environ, {"PATCHVAULT_CATALOG_URL": "env", "OTHER": "x"}):
+        with mock.patch.object(vault, "parse_dotenv", return_value={"PATCHVAULT_RELEASES_URL": "file"}), \
+                mock.patch.dict(vault.os.environ, {"PATCHVAULT_RELEASES_URL": "env", "OTHER": "x"}):
             config = vault.load_config()
-        self.assertEqual(config["PATCHVAULT_CATALOG_URL"], "env")
+        self.assertEqual(config["PATCHVAULT_RELEASES_URL"], "env")
         self.assertNotIn("OTHER", config)
 
-    def test_missing_key_is_reported(self):
-        with mock.patch.object(vault, "load_config", return_value={}), self.assertRaises(ValueError):
-            vault.catalog_key()
 
-    def test_check_without_urls_reports_an_error(self):
-        with tempfile.TemporaryDirectory() as folder, mock.patch.object(vault, "load_config", return_value={}):
-            store = vault.Vault(folder)
-            store.check()
-            self.assertIn("PATCHVAULT_CATALOG_URL", store.check_error)
+class CatalogManagementTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = Path(folder.name)
+        self.store = vault.Vault(self.dir)
+
+    def served(self, games):
+        raw = json.dumps({"mods": [entry(id=game, name=game.title()) for game in games]}).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = raw
+        return mock.patch.object(vault, "http_get", return_value=response)
+
+    def add(self, name, url, games=("one",)):
+        with self.served(games):
+            return self.store.add_catalog(name, url)
+
+    def test_starts_empty(self):
+        self.assertIsNone(self.store.catalog)
+        self.assertEqual(self.store.items, [])
+        self.store.check()
+        self.assertIsNone(self.store.check_error)
+
+    def test_adding_switches_to_the_new_catalog(self):
+        self.add("First One", "https://a.test/c.json")
+        self.assertEqual(self.store.catalog["folder"], "first-one")
+        self.assertEqual([item["id"] for item in self.store.items], ["one"])
+
+    def test_rejects_bad_urls_and_duplicates(self):
+        with self.assertRaises(ValueError):
+            self.store.add_catalog("x", "http://a.test/c.json")
+        self.add("x", "https://a.test/c.json")
+        with self.assertRaises(ValueError):
+            self.store.add_catalog("y", "https://a.test/c.json")
+
+    def test_rejects_files_that_are_not_catalogs(self):
+        for body in (b"not json", b"[]", b'{"mods": []}'):
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = body
+            with mock.patch.object(vault, "http_get", return_value=response), self.assertRaises(ValueError):
+                self.store.add_catalog("x", "https://a.test/c.json")
+        self.assertEqual(self.store.catalogs, [])
+
+    def test_same_name_gets_its_own_folder(self):
+        self.add("Same", "https://a.test/1.json")
+        self.assertEqual(self.add("Same", "https://a.test/2.json")["folder"], "same-2")
+
+    def test_catalogs_keep_separate_games_and_state(self):
+        first = self.add("A", "https://a.test/c.json", ("one",))
+        item = self.store.items[0]
+        target = self.store.root / vault.target_path(item)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"zip")
+        self.store._commit(item, target)
+        self.add("B", "https://b.test/c.json", ("one", "two"))
+        self.assertEqual(len(self.store.items), 2)
+        self.assertEqual(self.store.status_of(self.store.items[0]), "missing")
+        self.store.select_catalog(first["folder"])
+        self.assertEqual(len(self.store.items), 1)
+        self.assertEqual(self.store.status_of(self.store.items[0]), "ok")
+
+    def test_selection_survives_a_restart(self):
+        first = self.add("A", "https://a.test/c.json")
+        self.add("B", "https://b.test/c.json")
+        self.store.select_catalog(first["folder"])
+        reopened = vault.Vault(self.dir)
+        self.assertEqual(reopened.catalog["folder"], "a")
+        self.assertEqual(len(reopened.catalogs), 2)
+        self.assertEqual(len(reopened.items), 1)
+
+    def test_removing_keeps_downloads_and_moves_on(self):
+        self.add("A", "https://a.test/c.json")
+        second = self.add("B", "https://b.test/c.json")
+        kept = self.store.root / "kept.zip"
+        kept.parent.mkdir(parents=True)
+        kept.write_bytes(b"zip")
+        self.store.remove_catalog(second["folder"])
+        self.assertEqual(self.store.catalog["folder"], "a")
+        self.assertTrue(kept.exists())
+        self.store.remove_catalog("a")
+        self.assertIsNone(self.store.catalog)
+
+    def test_cannot_add_while_downloading(self):
+        self.store.jobs["x"] = {"phase": "downloading"}
+        with self.assertRaises(ValueError):
+            self.add("x", "https://a.test/c.json")
+
+    def test_check_failure_keeps_the_old_list(self):
+        self.add("A", "https://a.test/c.json")
+        with mock.patch.object(vault, "http_get", side_effect=OSError("offline")):
+            self.store.check()
+        self.assertEqual(len(self.store.items), 1)
+        self.assertEqual(self.store.check_error, "offline")
+
+    def test_a_late_result_does_not_touch_the_new_catalog(self):
+        self.add("A", "https://a.test/c.json")
+        self.add("B", "https://b.test/c.json", ("two", "three"))
+        response = mock.MagicMock()
+
+        def switch_then_read(*_):
+            self.store.select_catalog("a")
+            return json.dumps({"mods": [entry(id="late")]}).encode()
+
+        response.__enter__.return_value.read.side_effect = switch_then_read
+        with mock.patch.object(vault, "http_get", return_value=response):
+            self.store.check()
+        self.assertEqual([item["id"] for item in self.store.items], ["one"])
 
 
 class CatalogTests(unittest.TestCase):
@@ -207,6 +245,154 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(store.status_of({**item, "sha256": "1" * 64}), "update")
             target.unlink()
             self.assertEqual(store.status_of(item), "missing")
+
+
+class AppUpdateTests(unittest.TestCase):
+    URL = "https://example.com/latest"
+
+    def check(self, current, body):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = body
+        config = {vault.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(vault, "load_config", return_value=config), \
+                mock.patch.object(vault, "http_get", return_value=response) as get:
+            store = vault.Vault(folder)
+            store.check_app_update()
+        return store.app_update, get
+
+    def release(self, tag):
+        return f'{{"tag_name": "{tag}", "html_url": "https://github.com/o/r/releases/tag/{tag}"}}'.encode()
+
+    def test_picks_the_asset_for_this_platform(self):
+        asset = {"name": vault.asset_name(), "size": 5, "digest": "sha256:" + "a" * 64,
+                 "browser_download_url": "https://github.com/o/r/releases/download/v1/a.zip"}
+        release = {"assets": [{"name": "other.zip"}, asset]}
+        self.assertEqual(vault.Vault.pick_asset(release),
+                         {"url": asset["browser_download_url"], "size": 5, "sha256": "a" * 64})
+
+    def test_rejects_assets_that_cannot_be_verified(self):
+        good = {"name": vault.asset_name(), "size": 5, "digest": "sha256:" + "a" * 64,
+                "browser_download_url": "https://github.com/o/r/a.zip"}
+        for change in ({"digest": None}, {"digest": "md5:abc"}, {"size": 0}, {"size": vault.MAX_UPDATE + 1},
+                       {"browser_download_url": "https://evil.test/a.zip"}):
+            self.assertIsNone(vault.Vault.pick_asset({"assets": [{**good, **change}]}))
+        self.assertIsNone(vault.Vault.pick_asset({"assets": []}))
+
+    def test_app_version(self):
+        with mock.patch.object(vault, "load_config", return_value={vault.VERSION_KEY: "v1.2.3"}):
+            self.assertEqual(vault.app_version(), "v1.2.3")
+        with mock.patch.object(vault, "load_config", return_value={vault.VERSION_KEY: ""}):
+            self.assertEqual(vault.app_version(), "dev")
+
+    def test_parses_versions(self):
+        self.assertEqual(vault.parse_version("v1.2.3"), (1, 2, 3))
+        for text in ("", "dev", "v1.2", "1.2.3-beta"):
+            self.assertIsNone(vault.parse_version(text))
+
+    def test_reports_a_newer_release(self):
+        update, _ = self.check("v1.9.0", self.release("v1.10.0"))
+        self.assertEqual(update["tag"], "v1.10.0")
+
+    def test_ignores_same_or_older_releases(self):
+        for tag in ("v1.2.3", "v1.2.2"):
+            self.assertIsNone(self.check("v1.2.3", self.release(tag))[0])
+
+    def test_builds_without_a_version_never_ask(self):
+        update, get = self.check("", self.release("v9.0.0"))
+        self.assertIsNone(update)
+        get.assert_not_called()
+
+    def test_ignores_bad_responses(self):
+        for body in (b"not json", b"{}", b"[]", b'{"tag_name": "v9.0.0", "html_url": "http://x.test"}'):
+            self.assertIsNone(self.check("v1.0.0", body)[0])
+
+
+class SelfUpdateTests(unittest.TestCase):
+    NAME = "PatchVault"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = Path(folder.name)
+        self.program = self.dir / self.NAME
+        self.program.write_bytes(b"old program")
+        self.data = self.dir / "downloaded" / "game.zip"
+        self.data.parent.mkdir()
+        self.data.write_bytes(b"my data")
+
+    def release_zip(self, members=None):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as output:
+            for name, content in (members or {self.NAME: b"new program", "downloaded/": b"", "covers/": b""}).items():
+                output.writestr(name, content)
+        return buffer.getvalue()
+
+    def install(self, body, asset=None):
+        digest = hashlib.sha256(body).hexdigest()
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(body)
+        asset = {"url": "https://github.com/a", "size": len(body), "sha256": digest, **(asset or {})}
+        store = vault.Vault(self.dir)
+        with mock.patch.object(vault, "http_get", return_value=response), \
+                mock.patch.object(vault, "program_path", return_value=self.program), \
+                mock.patch.object(vault.sys, "platform", "linux"):
+            store.install_app_update({"asset": asset})
+        return store.app_update_job
+
+    def test_replaces_the_program_and_keeps_data_and_a_backup(self):
+        job = self.install(self.release_zip())
+        self.assertEqual(job["phase"], "done")
+        self.assertEqual(self.program.read_bytes(), b"new program")
+        self.assertEqual(vault.backup_path(self.program).read_bytes(), b"old program")
+        self.assertEqual(self.data.read_bytes(), b"my data")
+
+    def test_new_program_is_executable(self):
+        self.install(self.release_zip())
+        if sys.platform != "win32":
+            self.assertTrue(self.program.stat().st_mode & 0o100)
+
+    def test_wrong_digest_changes_nothing(self):
+        job = self.install(self.release_zip(), {"sha256": "0" * 64})
+        self.assertEqual(job["phase"], "error")
+        self.assertEqual(self.program.read_bytes(), b"old program")
+        self.assertFalse(vault.backup_path(self.program).exists())
+
+    def test_oversized_download_is_stopped(self):
+        job = self.install(self.release_zip(), {"size": 3})
+        self.assertEqual(job["phase"], "error")
+        self.assertEqual(self.program.read_bytes(), b"old program")
+
+    def test_zip_without_the_program_changes_nothing(self):
+        job = self.install(self.release_zip({"covers/": b"", "other": b"x"}))
+        self.assertEqual(job["phase"], "error")
+        self.assertEqual(self.program.read_bytes(), b"old program")
+
+    def test_failed_swap_restores_the_old_program(self):
+        new = self.dir / "new"
+        new.write_bytes(b"new")
+        with mock.patch.object(vault.shutil, "move", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            vault.swap_program(new, self.program)
+        self.assertEqual(self.program.read_bytes(), b"old program")
+
+    def test_next_start_removes_the_backup(self):
+        backup = vault.backup_path(self.program)
+        backup.write_bytes(b"old")
+        with mock.patch.object(vault.sys, "frozen", True, create=True), \
+                mock.patch.object(vault, "program_path", return_value=self.program):
+            vault.remove_old_program()
+        self.assertFalse(backup.exists())
+
+    def test_work_files_are_removed(self):
+        self.install(self.release_zip())
+        self.assertFalse((self.dir / ".parts" / "app-update").exists())
+
+    def test_only_frozen_builds_with_an_asset_self_update(self):
+        self.assertFalse(vault.can_self_update({"asset": {"url": "x"}}))
+        with mock.patch.object(vault.sys, "frozen", True, create=True), \
+                mock.patch.object(vault, "program_path", return_value=self.program):
+            self.assertTrue(vault.can_self_update({"asset": {"url": "x"}}))
+            self.assertFalse(vault.can_self_update({"asset": None}))
 
 
 class PlatformTests(unittest.TestCase):
