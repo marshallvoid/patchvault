@@ -62,6 +62,7 @@ CATALOGS_DIR = ".catalogs"
 MAX_UPDATE = 300 * 1024 * 1024
 TITLES_URL = "https://raw.githubusercontent.com/blawar/titledb/master/US.en.json"
 TITLES_FILE = "_titles.json"
+BACKUP_DIR = "backup"
 TITLES_MAX_AGE = 7 * 24 * 3600
 FIRST_GAME_TITLE = 0x0100000000010000
 MAX_TITLES = 400 * 1024 * 1024
@@ -84,7 +85,12 @@ ASSET_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 DISPLAY_VERSION = re.compile(r"v?\d+(?:\.\d+)*")
 # File names hold words like "2" or "1080p", so only 1.2 or v2 count as a version here.
+# A source named [1.1.1-v262144] already gives the game's displayed and internal versions.
+VERSION_PAIR = re.compile(r"\[(v?\d+(?:\.\d+)*)-(v\d+)\]", re.IGNORECASE)
 VERSION_IN_NAME = re.compile(r"(?<![^\W_])(?:v?\d+(?:\.\d+)+|v\d+)(?![^\W_])", re.IGNORECASE)
+TRAILING_TAG = re.compile(r"\[([^\[\]]+)\]\s*$")
+TRAILING_FOLDER_TAG = re.compile(r"\S.*\s-\s*\[([^\[\]]+)\]\s*$")
+LEADING_TAG = re.compile(r"\[([^\[\]]+)\]\s*-?\s*[^\s\[]")
 MOD_WORDS = re.compile(r"[\s._-]*\b(?:vi[ệe]t\s*h[oó][aá]|vietnamese|vietsub|patch|mod)\b[\s._-]*$", re.IGNORECASE)
 
 
@@ -651,6 +657,15 @@ def clean_mod_name(text):
     return "" if text.lower() in WRAPPER_NAMES or TITLE_ID.match(text) else text
 
 
+def internal_version(kind, path, root, version):
+    """The internal version a source gives for this game version, if it gives one."""
+    relative = path.relative_to(root)
+    names = ([relative.stem] if kind == "zip" else []) + [parent.name for parent in relative.parents if parent.name]
+    pairs = (VERSION_PAIR.search(name) for name in names)
+    wanted = display_version(version).lstrip("vV")
+    return next((pair.group(2) for pair in pairs if pair and pair.group(1).lstrip("vV") == wanted), INTERNAL_VERSION)
+
+
 def guess_details(kind, path, root):
     """Name and version from the file name and the folders around it, nearest first."""
     relative = path.relative_to(root)
@@ -659,6 +674,22 @@ def guess_details(kind, path, root):
     versions = (VERSION_IN_NAME.search(candidate) for candidate in names)
     version = next((match.group(0) for match in versions if match), "")
     return name, version
+
+
+def source_mod_name(kind, path, root):
+    """The mod name a source already carries: a trailing [tag] on a zip, or a folder named
+    [tag] - Game or Game - [tag]. Tags holding a version are not names, and neither is a
+    folder that is only a [tag], which groups mods rather than naming one."""
+    relative = path.relative_to(root)
+    tags = [TRAILING_TAG.search(relative.stem)] if kind == "zip" else []
+    for parent in relative.parents:
+        if parent.name:
+            tags += [LEADING_TAG.match(parent.name), TRAILING_FOLDER_TAG.search(parent.name)]
+    for tag in filter(None, tags):
+        name = safe_name(tag.group(1))
+        if name and not VERSION_IN_NAME.search(name) and not name.endswith(f"-{INTERNAL_VERSION}"):
+            return name
+    return ""
 
 
 def parse_titles(data):
@@ -689,11 +720,20 @@ def tidy_capitals(name):
     return re.sub(r"[^\s-]+", tidy, name) if name.isupper() else name
 
 
+def strip_accents(text):
+    """Pokémon to Pokemon. Marks on other scripts stay, since they change the letter there."""
+    kept = []
+    for char in unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D")):
+        if not (unicodedata.category(char) == "Mn" and kept and ord(kept[-1]) < 0x250):
+            kept.append(char)
+    return unicodedata.normalize("NFC", "".join(kept))
+
+
 def clean_game_name(name):
-    """A game name for a folder: letters of any language, digits, spaces and hyphens only.
+    """A game name for a folder: letters without accents, digits, spaces and hyphens only.
     Slashes separate words, so they become spaces; other symbols simply go. All-capitals
     names are tidied too."""
-    text = re.sub(r"[/\\|]+", " ", unicodedata.normalize("NFC", name))
+    text = re.sub(r"[/\\|]+", " ", strip_accents(name))
     text = "".join(char for char in text if char in " -" or char.isspace() or unicodedata.category(char)[0] in "LNM")
     text = re.sub(r"\s+", " ", text).strip(" -")[:120]
     return tidy_capitals(text) or safe_name(name)
@@ -703,9 +743,9 @@ def game_folder(name, mod):
     return f"{clean_game_name(name)} - [{mod}]"
 
 
-def normalized_path(name, version, mod):
+def normalized_path(name, version, mod, internal=INTERNAL_VERSION):
     """Path of a normalized mod, relative to the folder it is saved in."""
-    return Path(game_folder(name, mod)) / f"[{display_version(version)}-{INTERNAL_VERSION}] [{mod}].zip"
+    return Path(game_folder(name, mod)) / f"[{display_version(version)}-{internal}] [{mod}].zip"
 
 
 def is_game_title(title):
@@ -730,9 +770,12 @@ def title_plan(kind, paths, titles, scan, message=None, size=0):
     name = official or guess_name or title
     version = (entry and entry["game_version"]) or guess_version
     source = paths[0] if len(paths) == 1 else paths[0].parent
+    mod = source_mod_name(kind, paths[0], scan["root"]) or scan["mod"]
+    internal = internal_version(kind, paths[0], scan["root"], version)
     return {"kind": kind, "source": source, "paths": paths, "title_id": title, "extra_titles": len(titles) - 1,
-            "name": name, "version": version,
-            "guessed": not official, "target": scan["dest"] / normalized_path(name, version, scan["mod"]),
+            "name": name, "version": version, "mod": mod, "internal": internal,
+            "stored": paths[0].stat().st_size if kind == "zip" else size,
+            "guessed": not official, "target": scan["dest"] / normalized_path(name, version, mod, internal),
             "status": "error" if message else "ready", "message": message or "", "size": size, "written": 0}
 
 
@@ -747,7 +790,8 @@ def separate_clashes(plans, scan):
             for plan in group:
                 if plan["guessed"]:
                     plan["name"] = f"{plan['name']} {plan['title_id']}"
-                    plan["target"] = scan["dest"] / normalized_path(plan["name"], plan["version"], scan["mod"])
+                    plan["target"] = scan["dest"] / normalized_path(
+                        plan["name"], plan["version"], plan["mod"], plan["internal"])
 
 
 def mark_conflicts(plans):
@@ -798,9 +842,21 @@ def plan_mods(root, dest, known, names, mod):
     return plans
 
 
-def remove_source(path, root):
-    """Delete a processed source, then any wrapper folders it leaves empty, up to root."""
-    remove_path(path)
+def free_path(path):
+    """path, or the first numbered variant of it that is not taken."""
+    candidate, number = path, 2
+    while candidate.exists():
+        name = f"{path.name} ({number})" if path.is_dir() else f"{path.stem} ({number}){path.suffix}"
+        candidate, number = path.with_name(name), number + 1
+    return candidate
+
+
+def back_up(path, root, backup):
+    """Move a processed source into backup at the same relative path, then remove any wrapper
+    folders it leaves empty, up to root."""
+    target = free_path(backup / path.relative_to(root))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(target))
     for parent in path.parents:
         if parent == root or root not in parent.parents:
             break
@@ -808,6 +864,7 @@ def remove_source(path, root):
             parent.rmdir()
         except OSError:
             break
+    return target
 
 
 def sha256_of(path):
@@ -839,13 +896,15 @@ class Vault:
         self.cancels = {}
         self.queue = queue.Queue()
         self.download_log = []
+        self.batch = self.new_batch()
+        self.batch_number = 0
         self.checked_at = None
         self.check_error = None
         self.checking = False
         self.app_update = None
         self.app_update_job = None
         self.normalize_job = {"phase": "idle", "plans": [], "done": 0, "total": 0, "message": "", "failed": False,
-                              "bytes_done": 0, "bytes_total": 0, "log": []}
+                              "bytes_done": 0, "bytes_total": 0, "log": [], "runs": 0}
         self.normalize_cancel = threading.Event()
         registry = self._load_json(self.registry_path, {})
         titles = self._load_json(self.catalogs_dir / TITLES_FILE, {})
@@ -1119,7 +1178,7 @@ class Vault:
         record = self.state.get(entry["id"])
         if not record:
             # Copied in by hand, so its hash is unknown: only the name can say which version it is.
-            prefix = f"[{display_version(entry['game_version'])}-{INTERNAL_VERSION}]"
+            prefix = f"[{display_version(entry['game_version'])}-"
             return "ok" if any(path.name.startswith(prefix) for path in zips) else "update"
         # The original file's SHA-256 is the surest way to spot a new release. When the
         # catalog does not carry one, fall back to comparing the version it reports.
@@ -1148,14 +1207,45 @@ class Vault:
                 "app_update": self.app_update,
                 "app_update_job": self.app_update_job,
                 "log": list(self.download_log),
+                "batch": self.batch_progress(),
             }
+
+    @staticmethod
+    def new_batch():
+        return {"count": 0, "finished": 0, "total": 0, "passed": 0, "saved": 0, "failed": 0, "cancelled": 0}
+
+    def batch_progress(self):
+        """How far the downloads queued since the app was last idle are, in bytes. Catalogs
+        that give no sizes leave only the number of finished mods to go by."""
+        with self.lock:
+            batch = self.batch
+            running = sum(job["done"] for job in self.jobs.values() if job["phase"] != "error")
+            if batch["total"]:
+                fraction = (batch["passed"] + running) / batch["total"]
+            else:
+                fraction = batch["finished"] / max(1, batch["count"])
+            return {"active": self.busy(), "number": self.batch_number, "count": batch["count"],
+                    "finished": batch["finished"],
+                    "saved": batch["saved"], "failed": batch["failed"], "cancelled": batch["cancelled"],
+                    "fraction": min(1, fraction)}
+
+    def _finish_batch_item(self, entry, outcome="saved"):
+        with self.lock:
+            self.batch[outcome] += 1
+            self.batch["finished"] += 1
+            self.batch["passed"] += entry["size"]
 
     def enqueue(self, ids):
         with self.lock:
+            if not self.busy():
+                self.batch = self.new_batch()
+                self.batch_number += 1
             known = {entry["id"]: entry for entry in self.items}
             for entry_id in ids:
                 entry = known.get(entry_id)
                 if entry and entry_id not in self.jobs:
+                    self.batch["count"] += 1
+                    self.batch["total"] += entry["size"]
                     self.jobs[entry_id] = {"phase": "queued", "done": 0, "total": entry["size"], "speed": 0}
                     self.cancels[entry_id] = threading.Event()
                     self.queue.put(entry)
@@ -1320,13 +1410,17 @@ class Vault:
                 self._log_game(entry, f"đã lưu {target}", "ok")
                 with self.lock:
                     del self.jobs[entry_id]
+                    self._finish_batch_item(entry)
             except Cancelled:
-                self._log_game(entry, f"đã huỷ", "warn")
+                self._log_game(entry, "đã huỷ", "warn")
                 with self.lock:
                     del self.jobs[entry_id]
+                    self._finish_batch_item(entry, "cancelled")
             except Exception as error:
                 self._log_game(entry, f"lỗi: {error}", "error")
-                self._update_job(entry_id, phase="error", message=str(error), speed=0)
+                with self.lock:
+                    self._update_job(entry_id, phase="error", message=str(error), speed=0)
+                    self._finish_batch_item(entry, "failed")
             with self.lock:
                 self.cancels.pop(entry_id, None)
 
@@ -1414,13 +1508,15 @@ class Vault:
             # The source may sit inside the destination: nothing is written into it.
             if root == target or root in target.parents:
                 raise ValueError("Thư mục đích không được trùng hoặc nằm trong Thư mục nguồn")
+            if target / BACKUP_DIR in (root, *root.parents):
+                raise ValueError("Thư mục nguồn không được nằm trong thư mục backup")
             names = self.refresh_titles()
             plans = plan_mods(root, target, self.known_titles(), names, mod)
             ready = sum(plan["status"] == "ready" for plan in plans)
             message = f"Tìm thấy {len(plans)} mod, {ready} sẵn sàng chuẩn hóa." if plans else "Không tìm thấy mod nào."
             if plans and not names:
                 message += " Không tải được danh sách tên game nên tên được đoán từ tên file."
-            self._set_normalize(phase="scanned", plans=plans, root=root, message=message)
+            self._set_normalize(phase="scanned", plans=plans, root=root, dest=target, message=message)
             self._log(message, "ok" if ready and names else "warn")
         except (OSError, ValueError) as error:
             self._set_normalize(phase="idle", message=str(error) or type(error).__name__, failed=True)
@@ -1445,34 +1541,39 @@ class Vault:
             self.normalize_job["bytes_done"] += plan["size"] - plan["written"]
             plan.update(fields, written=plan["size"])
 
-    def _remove_processed(self, path, root, plans):
+    def _back_up(self, path, root, backup, plans):
         try:
             if path.exists():
-                remove_source(path, root)
-                self._log(f"Đã xoá {path.relative_to(root)}")
-        except OSError as error:
-            self._log(f"Không xoá được {path.relative_to(root)}: {error}", "error")
+                target = back_up(path, root, backup)
+                self._log(f"Đã chuyển vào backup: {target.relative_to(backup)}")
+        except (OSError, shutil.Error) as error:
+            self._log(f"Không chuyển được {path.relative_to(root)} vào backup: {error}", "error")
             with self.lock:
                 for plan in plans:
-                    plan["message"] = f"Đã lưu nhưng không xoá được file gốc: {error}"
+                    plan["message"] = f"Đã lưu nhưng không chuyển được file gốc vào backup: {error}"
 
-    def _remove_outer_folders(self, plans, root):
-        """Delete each top-level folder of the source, whatever else it holds, but only when
-        every mod found in it was saved: anything failed or skipped must keep its files."""
+    def _back_up_sources(self, plans, root, backup):
+        """Keep the originals of saved mods in the backup folder. A top-level source folder goes
+        whole, with whatever else it holds, once every mod found in it was saved. Otherwise only
+        the saved mods leave it, so anything failed or skipped keeps its files in place."""
         outer = {}
         for plan in plans:
             parts = plan["paths"][0].relative_to(root).parts
-            if len(parts) > 1:
-                outer.setdefault(root / parts[0], []).append(plan)
+            outer.setdefault(root / parts[0] if len(parts) > 1 else plan["paths"][0], []).append(plan)
         for folder, group in outer.items():
-            if all(plan["status"] == "done" for plan in group):
-                self._remove_processed(folder, root, group)
+            saved = [plan for plan in group if plan["status"] == "done"]
+            if len(saved) == len(group):
+                self._back_up(folder, root, backup, group)
+            else:
+                for plan in saved:
+                    for path in plan["paths"]:
+                        self._back_up(path, root, backup, [plan])
 
     def normalize_mods(self):
-        """Run the reviewed plan. A source is deleted only once its zip is saved."""
+        """Run the reviewed plan. A source moves to the backup folder only once its zip is saved."""
         with self.lock:
             job = self.normalize_job
-            plans, root = job["plans"], job.get("root")
+            plans, root, backup = job["plans"], job.get("root"), job["dest"] / BACKUP_DIR
             ready = [plan for plan in plans if plan["status"] == "ready"]
             job.update(phase="working", done=0, total=len(ready), message="", bytes_done=0,
                        bytes_total=sum(plan["size"] for plan in ready))
@@ -1496,8 +1597,6 @@ class Vault:
                 with self.lock:
                     job["done"] += 1
                 self._log(f"Đã lưu {plan['target']}", "ok")
-                for path in plan["paths"]:
-                    self._remove_processed(path, root, [plan])
             except Cancelled:
                 with self.lock:
                     job["bytes_done"] -= plan["written"]
@@ -1507,13 +1606,13 @@ class Vault:
             except Exception as error:
                 self._finish_plan(plan, status="error", message=str(error) or type(error).__name__)
                 self._log(f"Lỗi {clean_game_name(plan['name'])}: {plan['message']}", "error")
-        self._remove_outer_folders(plans, root)
+        self._back_up_sources(plans, root, backup)
         failed = sum(plan["status"] == "error" for plan in ready)
         message = f"Đã chuẩn hóa {job['done']}/{len(ready)} mod."
         message += f" {failed} mod lỗi." if failed else ""
         message = "Đã huỷ. " + message if cancelled else message
-        self._set_normalize(phase="scanned", message=message)
         self._log(message, "error" if failed else "warn" if cancelled else "ok")
+        self._set_normalize(phase="scanned", message=message, runs=job["runs"] + 1)
 
     def clear_error(self, entry_id):
         with self.lock:
@@ -1713,6 +1812,7 @@ class App:
         self.genre_panel = None
         self.genre_panel_anchor = None
         self.prompted_tag = None
+        self.reported_batch = 0
         self.catalog_folders = []
         self.manager = None
         self._style()
@@ -1760,17 +1860,25 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectForeground", c["ink"])
         style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"], borderwidth=0)
         style.configure("Vertical.TScrollbar", background=c["panel"], arrowcolor=c["muted"])
+        style.configure("Horizontal.TScrollbar", background=c["panel"], arrowcolor=c["muted"])
         style.configure("TNotebook", background=c["bg"], borderwidth=0, tabmargins=0)
-        style.configure("TNotebook.Tab", background=c["bg"], foreground=c["muted"], padding=(14, 6), borderwidth=0)
+        style.configure("TNotebook.Tab", background=c["bg"], foreground=c["muted"], padding=(14, 6), borderwidth=0,
+                        bordercolor=c["bg"], lightcolor=c["bg"], darkcolor=c["bg"])
+        # Tabs show where you are by color alone, so they drop the focus ring and the border.
+        style.layout("TNotebook.Tab", [("Notebook.tab", {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        button_layout = [("Button.border", {"sticky": "nswe", "children": [
+            ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})]
+        style.layout("View.TButton", button_layout)
+        style.layout("ViewActive.Accent.TButton", button_layout)
         # clam enlarges the selected tab through these two options; keep every tab the same size.
         style.map("TNotebook.Tab", background=[("selected", c["accent"]), ("active", c["line"])],
                   foreground=[("selected", c["accent_ink"])], padding=[("selected", (14, 6))],
-                  expand=[("selected", (0, 0, 0, 0))])
-        style.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["ink"],
-                        rowheight=26, borderwidth=0)
-        style.map("Treeview", background=[("selected", c["select"])], foreground=[("selected", c["ink"])])
-        style.configure("Treeview.Heading", background=c["panel"], foreground=c["muted"], relief="flat", padding=6)
-        style.map("Treeview.Heading", background=[("active", c["line"])])
+                  expand=[("selected", (0, 0, 0, 0))],
+                  bordercolor=[("selected", c["accent"]), ("active", c["line"])],
+                  lightcolor=[("selected", c["accent"]), ("active", c["line"])],
+                  darkcolor=[("selected", c["accent"]), ("active", c["line"])])
 
     def _build(self):
         header = ttk.Frame(self.root, padding=(14, 12, 14, 6))
@@ -1783,17 +1891,22 @@ class App:
         self.mod_entry.pack(side="right")
         ttk.Label(header, text="Tên mod", style="Muted.TLabel").pack(side="right", padx=(0, 6))
         self.mod_name.trace_add("write", lambda *_: self.vault.set_mod_name(self.mod_name.get()))
-        self.tabs = ttk.Notebook(self.root)
+        self.tabs = ttk.Notebook(self.root, takefocus=False)
         self.tabs.pack(fill="both", expand=True, padx=14)
         library = ttk.Frame(self.tabs)
-        self.tabs.add(library, text="Tải mod")
+        self.tabs.add(library, text="Tải về")
         normalizer = ttk.Frame(self.tabs, padding=(0, 12, 0, 0))
-        self.tabs.add(normalizer, text="Chuẩn hóa mod")
+        self.tabs.add(normalizer, text="Chuẩn hóa")
         self.normalizer = NormalizeTab(self, normalizer)
         top = ttk.Frame(library, padding=(0, 10, 0, 6))
         top.pack(fill="x")
-        target = ttk.Frame(library, padding=(0, 0, 0, 8))
+        target = self.library_target = ttk.Frame(library, padding=(0, 0, 0, 8))
         target.pack(fill="x")
+        self.overall = ttk.Frame(library, padding=(0, 0, 0, 8))
+        self.overall_label = ttk.Label(self.overall, style="Muted.TLabel")
+        self.overall_label.pack(side="left", padx=(0, 10))
+        self.overall_bar = ttk.Progressbar(self.overall, maximum=1000)
+        self.overall_bar.pack(side="left", fill="x", expand=True)
         ttk.Label(target, text="Thư mục đích", style="Muted.TLabel").pack(side="left", padx=(0, 6))
         self.library_views = ViewSwitch(target, self.show_library_view)
         self.download_button = ttk.Button(target, text="Chọn…", command=self.browse_download)
@@ -2282,6 +2395,7 @@ class App:
         self.show_detail()
         self.paint_header(snapshot)
         self.download_log.paint(snapshot["log"])
+        self.paint_overall(snapshot["batch"])
         self.normalizer.paint(self.vault.normalize_snapshot())
         self.mod_entry.state(["disabled"] if self.vault.normalizing() else ["!disabled"])
         downloading = ["disabled"] if self.vault.busy() else ["!disabled"]
@@ -2289,6 +2403,30 @@ class App:
         self.download_button.state(downloading)
         self.paint_app_update(snapshot["app_update"], snapshot["app_update_job"])
         self.root.after(400, self.refresh)
+
+    def paint_overall(self, batch):
+        if not batch["active"]:
+            self.overall.pack_forget()
+            # Numbers, not a seen-it-running flag: a short batch can start and end between repaints.
+            if batch["number"] != self.reported_batch:
+                self.reported_batch = batch["number"]
+                self.report_downloads(batch)
+            return
+        self.overall_bar["value"] = 1000 * batch["fraction"]
+        self.overall_label.configure(
+            text=f"Đang tải {batch['finished']}/{batch['count']} mod · {100 * batch['fraction']:.0f}%")
+        if not self.overall.winfo_manager():
+            self.overall.pack(fill="x", after=self.library_target)
+
+    def report_downloads(self, batch):
+        """Say how a batch ended, unless the user stopped it before anything came of it."""
+        if batch["saved"] or batch["failed"]:
+            text = f"Đã tải xong {batch['saved']}/{batch['count']} mod."
+            if batch["failed"]:
+                text += f" {batch['failed']} mod lỗi."
+            if batch["cancelled"]:
+                text += f" {batch['cancelled']} mod đã huỷ."
+            self.root.after_idle(show_message, "Tải xong", text, self.root)
 
     def paint_catalogs(self, snapshot):
         folders = [catalog["folder"] for catalog in snapshot["catalogs"]]
@@ -2638,31 +2776,89 @@ class ViewSwitch:
 
     def __init__(self, toolbar, swap):
         self.swap = swap
-        self.log_tab = ttk.Button(toolbar, text="Log", command=lambda: self.show("log"))
+        self.log_tab = ttk.Button(toolbar, text="Log", takefocus=False, command=lambda: self.show("log"))
         self.log_tab.pack(side="right")
-        self.list_tab = ttk.Button(toolbar, text="Danh sách", command=lambda: self.show("list"))
+        self.list_tab = ttk.Button(toolbar, text="Danh sách", takefocus=False, command=lambda: self.show("list"))
         self.list_tab.pack(side="right", padx=(12, 6))
 
     def show(self, view):
         self.swap(view)
-        self.log_tab.configure(style="Accent.TButton" if view == "log" else "TButton")
-        self.list_tab.configure(style="TButton" if view == "log" else "Accent.TButton")
+        self.log_tab.configure(style="ViewActive.Accent.TButton" if view == "log" else "View.TButton")
+        self.list_tab.configure(style="View.TButton" if view == "log" else "ViewActive.Accent.TButton")
+
+
+class ModRow:
+    """One row of the normalize list. Like GameRow, it exists because a Treeview cell cannot
+    wrap long text or hold a real progress bar."""
+
+    COLORS = {"ready": "ink", "working": "accent", "done": "ok", "conflict": "muted", "error": "bad"}
+
+    def __init__(self, tab):
+        self.tab = tab
+        self.painted = None
+        self.frame = tk.Frame(tab.rows_frame, bg=COLORS["field"])
+        self.labels = {}
+        for index, (name, _, _) in enumerate(tab.COLUMNS):
+            if name == "progress":
+                self.progress_cell = tk.Frame(self.frame, bg=COLORS["field"], padx=8, pady=9)
+                self.progress_cell.grid(row=0, column=index, sticky="new")
+                self.bar = ttk.Progressbar(self.progress_cell, maximum=1000)
+                self.percent = tk.Label(self.progress_cell, width=5, anchor="e", bd=0, font=tab.app.font,
+                                        bg=COLORS["field"], fg=COLORS["ink"])
+                self.percent.pack(side="right")
+                self.bar.pack(side="left", fill="x", expand=True)
+            else:
+                label = tk.Label(self.frame, anchor="nw", justify="left", padx=8, pady=8, bd=0,
+                                 font=tab.app.font, bg=COLORS["field"], fg=COLORS["ink"])
+                label.grid(row=0, column=index, sticky="nsew")
+                self.labels[name] = label
+        for widget in (self.frame, self.progress_cell, self.bar, self.percent, *self.labels.values()):
+            tab.bind_scroll(widget)
+
+    def fit(self, widths):
+        for index, ((name, _, _), width) in enumerate(zip(self.tab.COLUMNS, widths)):
+            self.frame.columnconfigure(index, minsize=width)
+            if name in self.labels and name not in self.tab.FITTED:
+                self.labels[name].configure(wraplength=width - 16)
+
+    def paint(self, cells, status, fraction):
+        key = (cells, status, fraction)
+        if key == self.painted:
+            return
+        self.painted = key
+        color = COLORS[self.COLORS[status]]
+        for name, label in self.labels.items():
+            label.configure(text=cells[name], fg=color)
+        if fraction is None:
+            self.bar.pack_forget()
+            self.percent.configure(text="-", fg=color)
+        else:
+            if not self.bar.winfo_manager():
+                self.bar.pack(side="left", fill="x", expand=True)
+            self.bar["value"] = 1000 * fraction
+            self.percent.configure(text=f"{100 * fraction:.0f}%", fg=color)
 
 
 class NormalizeTab:
     """Tab that tidies a folder of mods into the vault layout: scan, review, then move."""
 
-    COLUMNS = (("source", "Nguồn", 340), ("title", "Title ID", 170), ("name", "Tên game", 280),
-               ("version", "Phiên bản game", 120), ("progress", "Tiến độ", 190), ("status", "Trạng thái", 280))
+    # Width in pixels, or a share of what the fixed columns leave. Columns in FITTED grow to
+    # their content and never wrap; when they need more room, the table scrolls sideways.
+    COLUMNS = (("source", "Nguồn", 0.4), ("title", "Title ID", 200), ("name", "Tên game", 0.25), ("mod", "Tên mod", 140),
+               ("version", "Phiên bản game", 125), ("size", "Dung lượng", 100), ("progress", "Tiến độ", 200),
+               ("output", "Tên sau chuẩn hóa", 300), ("status", "Trạng thái", 0.35))
+    FITTED = ("version", "output")
+    MIN_SHARED = 760
+    CELL_PADDING = 18
     STATUS = {"ready": "Sẵn sàng", "working": "Đang đóng gói", "done": "Đã chuẩn hóa", "conflict": "Bỏ qua",
               "error": "Lỗi"}
-    BAR_CELLS = 14
 
     def __init__(self, app, parent):
         self.app = app
         self.vault = app.vault
         self.painted = None
         self.row_keys = []
+        self.reported_runs = 0
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(4, weight=1)
         self.source = tk.StringVar()
@@ -2685,23 +2881,82 @@ class NormalizeTab:
         self.status.pack(side="left", padx=(12, 0))
         self.views = ViewSwitch(actions, self.show_view)
         self.progress = ttk.Progressbar(parent, maximum=1000)
-        table = ttk.Frame(parent)
-        table.grid(row=4, column=0, columnspan=3, sticky="nsew")
-        self.table = table
-        self.tree = ttk.Treeview(table, columns=[name for name, _, _ in self.COLUMNS], show="headings",
-                                 selectmode="browse")
-        for name, title, width in self.COLUMNS:
-            self.tree.heading(name, text=title, anchor="w")
-            self.tree.column(name, width=width, anchor="w", stretch=name in ("source", "name"))
-        for status, color in (("ready", "ink"), ("working", "accent"), ("done", "ok"), ("conflict", "muted"),
-                              ("error", "bad")):
-            self.tree.tag_configure(status, foreground=COLORS[color])
-        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
+        self.table = tk.Frame(parent, bg=COLORS["panel"])
+        self.header_canvas = tk.Canvas(self.table, bg=COLORS["panel"], bd=0, highlightthickness=0, height=1)
+        self.header_canvas.pack(fill="x")
+        self.header = tk.Frame(self.header_canvas, bg=COLORS["panel"])
+        self.header_window = self.header_canvas.create_window(0, 0, anchor="nw", window=self.header)
+        self.header.bind("<Configure>", lambda event: self.header_canvas.configure(
+            height=event.height, scrollregion=self.header_canvas.bbox("all")))
+        for index, (_, title, _) in enumerate(self.COLUMNS):
+            tk.Label(self.header, text=title, anchor="w", padx=8, pady=7, bd=0, font=app.font,
+                     bg=COLORS["panel"], fg=COLORS["muted"]).grid(row=0, column=index, sticky="ew")
+        self.holder = tk.Frame(self.table, bg=COLORS["field"])
+        self.holder.pack(fill="both", expand=True)
+        holder = self.holder
+        self.canvas = tk.Canvas(holder, bg=COLORS["field"], bd=0, highlightthickness=0)
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=self.canvas.yview)
+        # The header stops where the rows do, or the two would scroll by different amounts.
+        self.header_canvas.pack_configure(padx=(0, scroll.winfo_reqwidth()))
+        self.side_scroll = ttk.Scrollbar(self.table, orient="horizontal", command=self.scroll_sideways)
+        self.canvas.configure(yscrollcommand=scroll.set, xscrollcommand=self.follow_sideways)
         scroll.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.rows_frame = tk.Frame(self.canvas, bg=COLORS["line"])
+        self.rows_window = self.canvas.create_window(0, 0, anchor="nw", window=self.rows_frame)
+        self.rows_frame.bind("<Configure>", lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self.fit)
+        self.bind_scroll(self.canvas)
+        self.rows = []
+        self.widths = [width if width > 1 else 200 for _, _, width in self.COLUMNS]
+        self.working = None
+        self.measure = tkfont.Font(root=app.root, font=app.font)
+        self.canvas_width = 0
+        self.fitted = {name: self.measure.measure(title) + self.CELL_PADDING
+                       for name, title, _ in self.COLUMNS if name in self.FITTED}
         self.log = LogPane(app, parent)
         self.views.show("list")
+
+    def bind_scroll(self, widget):
+        widget.bind("<Button-4>", lambda _: self.scroll(-1))
+        widget.bind("<Button-5>", lambda _: self.scroll(1))
+        widget.bind("<MouseWheel>", lambda event: self.scroll(-1 if event.delta > 0 else 1))
+        widget.bind("<Shift-Button-4>", lambda _: self.scroll_sideways("scroll", -3, "units"))
+        widget.bind("<Shift-Button-5>", lambda _: self.scroll_sideways("scroll", 3, "units"))
+        widget.bind("<Shift-MouseWheel>", lambda event: self.scroll_sideways(
+            "scroll", -3 if event.delta > 0 else 3, "units"))
+
+    def scroll_sideways(self, *args):
+        self.canvas.xview(*args)
+
+    def follow_sideways(self, first, last):
+        """Keep the header over its columns, and show the bar only when there is more to see."""
+        self.side_scroll.set(first, last)
+        self.header_canvas.xview_moveto(first)
+        if float(last) - float(first) >= 1:
+            self.side_scroll.pack_forget()
+        elif not self.side_scroll.winfo_manager():
+            self.side_scroll.pack(side="bottom", fill="x", before=self.holder)
+
+    def scroll(self, units):
+        if self.rows_frame.winfo_height() > self.canvas.winfo_height():
+            self.canvas.yview_scroll(units, "units")
+
+    def fit(self, event):
+        self.canvas_width = event.width
+        self.apply_widths()
+
+    def apply_widths(self):
+        widths = [self.fitted.get(name, width) for name, _, width in self.COLUMNS]
+        spare = max(self.MIN_SHARED, self.canvas_width - sum(width for width in widths if width > 1))
+        self.widths = [width if width > 1 else int(spare * width) for width in widths]
+        total = max(self.canvas_width, sum(self.widths))
+        self.canvas.itemconfigure(self.rows_window, width=total)
+        self.header_canvas.itemconfigure(self.header_window, width=total)
+        for index, width in enumerate(self.widths):
+            self.header.columnconfigure(index, minsize=width)
+        for row in self.rows:
+            row.fit(self.widths)
 
     def show_view(self, view):
         shown, hidden = (self.log.frame, self.table) if view == "log" else (self.table, self.log.frame)
@@ -2722,45 +2977,73 @@ class NormalizeTab:
         count = sum(plan["status"] == "ready" for plan in self.vault.normalize_snapshot()["plans"])
         if count and not self.vault.normalizing() and ask_yes_no(
                 "Chuẩn hóa mod", f"Chuẩn hóa {count} mod? Sau khi lưu xong, file gốc và cả thư mục ngoài cùng chứa nó "
-                f"trong Thư mục nguồn sẽ bị xoá.", parent=self.app.root):
+                f"trong Thư mục nguồn sẽ được chuyển vào thư mục {BACKUP_DIR} trong Thư mục đích.",
+                parent=self.app.root):
             threading.Thread(target=self.vault.normalize_mods, daemon=True).start()
 
-    def row(self, plan, root):
+    def cells(self, plan, root):
         source = plan["source"]
         shown = source.relative_to(root).as_posix() if root else source.name
         status = self.STATUS[plan["status"]]
         if plan["message"]:
             status += ": " + plan["message"]
-        version = display_version(plan["version"])
         title = plan["title_id"] or "-"
         if plan["extra_titles"] > 0:
             title += f" +{plan['extra_titles']}"
-        name = clean_game_name(plan["name"])
-        return shown, title, name, "Miss" if version == MISSING_VERSION else version, self.bar(plan), status
+        version = display_version(plan["version"])
+        return {"source": shown, "title": title, "name": clean_game_name(plan["name"]), "mod": plan["mod"],
+                "version": "Miss" if version == MISSING_VERSION else (
+                    version if plan["internal"] == INTERNAL_VERSION else f"{version}-{plan['internal']}"),
+                "status": status,
+                "size": format_size(plan["stored"]) if plan["stored"] else "-",
+                "output": "-" if plan["status"] == "error" else
+                f"{plan['target'].parent.name}/{plan['target'].name}"}
 
-    def bar(self, plan):
-        """Text bar for a table row: a Treeview cell cannot hold a real progress bar."""
+    @staticmethod
+    def fraction(plan):
+        """How far a mod is, or None when it will not be packed."""
         if plan["status"] not in ("ready", "working", "done"):
-            return "-"
-        fraction = 1 if plan["status"] == "done" else min(1, plan["written"] / max(1, plan["size"]))
-        filled = round(fraction * self.BAR_CELLS)
-        return "█" * filled + "░" * (self.BAR_CELLS - filled) + f" {100 * fraction:.0f}%"
+            return None
+        return 1 if plan["status"] == "done" else min(1, plan["written"] / max(1, plan["size"]))
 
     def paint_rows(self, plans, root):
         keys = [(plan["source"], plan["title_id"]) for plan in plans]
         if keys != self.row_keys:
             self.row_keys = keys
-            self.tree.delete(*self.tree.get_children())
-            for index in range(len(plans)):
-                self.tree.insert("", "end", iid=str(index))
-        for index, plan in enumerate(plans):
-            self.tree.item(str(index), values=self.row(plan, root), tags=(plan["status"],))
-            if plan["status"] == "working":
-                self.tree.see(str(index))
+            for row in self.rows:
+                row.frame.destroy()
+            self.rows = [ModRow(self) for _ in plans]
+            for row in self.rows:
+                row.fit(self.widths)
+                row.frame.pack(fill="x", pady=(0, 1))
+            self.canvas.yview_moveto(0)
+        cells = [self.cells(plan, root) for plan in plans]
+        wanted = {name: max([self.measure.measure(title), *(self.measure.measure(cell[name]) for cell in cells)])
+                  + self.CELL_PADDING for name, title, _ in self.COLUMNS if name in self.FITTED}
+        if wanted != self.fitted:
+            self.fitted = wanted
+            self.apply_widths()
+        for row, plan, cell in zip(self.rows, plans, cells):
+            row.paint(cell, plan["status"], self.fraction(plan))
+        working = next((index for index, plan in enumerate(plans) if plan["status"] == "working"), None)
+        if working != self.working:
+            self.working = working
+            if working is not None:
+                self.see(self.rows[working].frame)
+
+    def see(self, frame):
+        self.app.root.update_idletasks()
+        total = self.rows_frame.winfo_height()
+        visible = self.canvas.winfo_height()
+        top = self.canvas.canvasy(0)
+        if frame.winfo_y() < top:
+            self.canvas.yview_moveto(frame.winfo_y() / total)
+        elif frame.winfo_y() + frame.winfo_height() > top + visible:
+            self.canvas.yview_moveto((frame.winfo_y() + frame.winfo_height() - visible) / total)
 
     def paint(self, job):
         plans = job["plans"]
-        key = (job["phase"], job["done"], job["message"], job["bytes_done"], len(job["log"]),
+        key = (job["phase"], job["runs"], job["done"], job["message"], job["bytes_done"], len(job["log"]),
                *((plan["status"], plan["message"], plan["written"]) for plan in plans))
         if key == self.painted:
             return
@@ -2785,6 +3068,10 @@ class NormalizeTab:
         self.status.configure(text=text, style="Error.TLabel" if job["failed"] else "Muted.TLabel")
         self.paint_rows(plans, job.get("root"))
         self.log.paint(job["log"])
+        if job["runs"] != self.reported_runs:
+            self.reported_runs = job["runs"]
+            if job["done"] or any(plan["status"] == "error" for plan in plans):
+                self.app.root.after_idle(show_message, "Chuẩn hóa xong", job["message"], self.app.root)
 
 
 def compose_banner(cover, background, size):

@@ -41,10 +41,11 @@ The file is layered top to bottom:
 - **`Vault`**. All state and logic, with no Tkinter dependency, which is what the tests exercise.
 - **Normalizing** (`plan_mods`, `Vault.scan_mods`, `Vault.normalize_mods`). Reuses `plan_repack`, `repack` and
   `normalized_path` for mods already on disk. Planning never touches the disk, so the UI can show a
-  review first. Sources are deleted only after every title in them is saved, a top-level source folder only
-  after every mod in it is saved, and targets are never overwritten. Game names come from titledb
+  review first. Sources move to `<destination>/backup` only after they are saved, a top-level source folder
+  only after every mod in it is saved, and targets are never overwritten. Game names come from titledb
   (`Vault.title_names`), cached in `.catalogs/_titles.json`. Downloads and normalizing share
-  `normalized_path` and one mod name, `Vault.mod_name`, saved in `.catalogs/index.json`
+  `normalized_path` and one mod name, `Vault.mod_name`, which normalizing uses only for sources with
+  no name of their own (`source_mod_name`). It is saved in `.catalogs/index.json`
   with both destination folders. `status_of` looks for zips in the game's folder under `Vault.root`
   (the destination, or the default) in both cases and uses the record only to identify the release.
 - **Game names**. `Vault._named` replaces each item's `name` with the titledb name and keeps the

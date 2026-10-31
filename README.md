@@ -28,19 +28,21 @@ catalog is included with the app.
 ## Naming
 
 You enter the mod name once at the top of the window, and it is required before downloading or
-normalizing. It can be anything, such as the language or the author of the mod.
+normalizing. It can be anything, such as the language or the author of the mod. When normalizing, a
+source that already carries a name keeps it, as in `[1.0.0] [60FPS].zip` or a `[60FPS] - Game` folder,
+so different mods of one game stay apart.
 
 Game names come from [titledb](https://github.com/blawar/titledb), then from a catalog listing the
 title ID, and when normalizing, from the file name. The database is about 90 MB, downloaded once
-and refreshed weekly. In paths and in the app, game names keep only letters, digits, spaces and
-hyphens, and all-capitals names become Title Case. A game with no known version uses `miss`.
+and refreshed weekly. In paths and in the app, game names keep only letters without accents, digits,
+spaces and hyphens, and all-capitals names become Title Case. A game with no known version uses `miss`.
 
 Only the title ID folders are kept, so instructions and other files around them are dropped. A
 pack with several title IDs, such as a game and a system font, stays one zip named after the game.
 
 ## Downloading
 
-Choose **Thư mục đích** in the **Tải mod** tab to save mods as `<folder>/<catalog>/...` instead of
+Choose **Thư mục đích** in the **Tải về** tab to save mods as `<folder>/<catalog>/...` instead of
 `downloaded/<catalog>/...`. The folder is remembered between runs.
 
 A game counts as downloaded when its `<Game name> - [<mod name>]` folder in the download folder in
@@ -49,17 +51,19 @@ Ctrl+click, Shift+click and Ctrl+A pick several games for **Tải đã chọn**.
 
 ## Normalizing existing mods
 
-The **Chuẩn hóa mod** tab takes a source folder and a destination folder. The source can have any
+The **Chuẩn hóa** tab takes a source folder and a destination folder. The source can have any
 structure: the app finds every zip and every folder of title IDs in it. **Quét** only shows what
 would happen, and **Chuẩn hóa** then saves each mod as:
 
 ```
-<destination>/<Game name> - [<mod name>]/[<game version>-unreviewed] [<mod name>].zip
+<destination>/<Game name> - [<mod name>]/[<game version>-<internal version>] [<mod name>].zip
 ```
 
-Once every mod in a top-level folder of the source is saved, that whole folder is deleted, including
-anything else in it. A folder with a failed or skipped mod stays, and existing files are never
-overwritten. The destination can contain the source, but not the other way round.
+The internal version comes from a source named like `[1.1.1-v262144]`, otherwise it is `unreviewed`.
+
+Originals are moved to `<destination>/backup/`, keeping their relative paths. Once every mod in a
+top-level folder of the source is saved, that whole folder moves, including anything else in it. If
+a mod in it failed or was skipped, only the saved mods move. Existing files are never overwritten. The destination can contain the source, but not the other way round.
 
 ## Install
 

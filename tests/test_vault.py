@@ -391,7 +391,7 @@ class NormalizeTests(unittest.TestCase):
         text = "\n".join(line for _, line in job["log"])
         self.assertIn("Đã lưu", text)
         self.assertIn("Bỏ qua", text)
-        self.assertIn("Đã xoá", text)
+        self.assertIn("Đã chuyển vào backup", text)
 
     def test_failed_mod_counts_as_passed_on_the_overall_bar(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1" * 1000})
@@ -586,16 +586,26 @@ class NormalizeTests(unittest.TestCase):
                               ("Castlevania: Belmont's Curse", "Castlevania Belmonts Curse"),
                               ("Fate/Stay Night", "Fate Stay Night"), ("Ori & the Blind Forest", "Ori the Blind Forest"),
                               ("Mario Kart™ 8 Deluxe!", "Mario Kart 8 Deluxe"), ("Spider-Man", "Spider-Man"),
-                              ("Trò Chơi Việt", "Trò Chơi Việt"), ("ドラゴンクエスト", "ドラゴンクエスト"), ("!!!", "!!!")):
+                              ("Trò Chơi Việt", "Tro Choi Viet"), ("Pokémon Legends Z-A", "Pokemon Legends Z-A"),
+                              ("ドラゴンクエスト", "ドラゴンクエスト"), ("!!!", "!!!")):
             self.assertEqual(vault.clean_game_name(raw), expected)
 
     def test_all_capitals_names_become_title_case(self):
         for raw, expected in (("OCTOPATH TRAVELER 0", "Octopath Traveler 0"), ("SPIDER-MAN", "Spider-Man"),
                               ("FINAL FANTASY VII", "Final Fantasy VII"),
-                              ("ĐẠI CHIẾN", "Đại Chiến"), ("SUPER MARIO 3D WORLD", "Super Mario 3D World"),
+                              ("ĐẠI CHIẾN", "Dai Chien"), ("SUPER MARIO 3D WORLD", "Super Mario 3D World"),
                               ("Mario KART 8", "Mario KART 8"), ("ドラゴン", "ドラゴン"),
                               (TITLE, TITLE), (f"PACK {TITLE}", f"Pack {TITLE}")):
             self.assertEqual(vault.clean_game_name(raw), expected)
+
+    def test_finds_a_save_from_before_accents_were_removed(self):
+        self.store.set_download_dir(str(self.base / "mine"))
+        item = vault.normalize(entry(name="Pokémon Game", sha256="a" * 64))
+        old = self.store.root / "Pokémon Game - [VI]" / "[miss-unreviewed] [VI].zip"
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b"zip")
+        self.store._commit(item, old)
+        self.assertEqual(self.store.status_of(item), "ok")
 
     def test_both_tabs_save_under_the_clean_name(self):
         path = vault.normalized_path("Castlevania: Belmont's Curse", "1.1.0", "VI")
@@ -614,6 +624,51 @@ class NormalizeTests(unittest.TestCase):
         new.write_bytes(b"zip")
         self.store._commit(item, new)
         self.assertFalse(old.parent.exists())
+
+    def queue_two(self, sizes=(100, 300)):
+        self.store.items = [vault.normalize(entry(id=name, name=name, size=size)) for name, size in zip("ab", sizes)]
+        self.store.enqueue(["a", "b"])
+
+    def test_overall_progress_counts_running_and_finished_bytes(self):
+        self.queue_two()
+        self.store.jobs["a"].update(phase="downloading", done=100)
+        self.assertEqual(self.store.batch_progress()["fraction"], 0.25)
+        del self.store.jobs["a"]
+        self.store._finish_batch_item(self.store.items[0])
+        self.store.jobs["b"].update(phase="downloading", done=150)
+        progress = self.store.batch_progress()
+        self.assertEqual((progress["fraction"], progress["finished"], progress["count"]), (0.625, 1, 2))
+
+    def test_overall_progress_does_not_count_a_failed_mod_twice(self):
+        self.queue_two()
+        self.store.jobs["a"].update(phase="error", done=60)
+        self.store._finish_batch_item(self.store.items[0])
+        self.assertEqual(self.store.batch_progress()["fraction"], 0.25)
+
+    def test_overall_progress_without_sizes_counts_mods(self):
+        self.queue_two((0, 0))
+        self.store._finish_batch_item(self.store.items[0])
+        self.assertEqual(self.store.batch_progress()["fraction"], 0.5)
+
+    def test_new_batch_starts_only_when_the_app_is_idle(self):
+        self.queue_two()
+        self.store.enqueue(["a"])
+        self.assertEqual(self.store.batch["count"], 2)
+        self.store.jobs.clear()
+        self.store.enqueue(["a"])
+        self.assertEqual((self.store.batch["count"], self.store.batch["total"]), (1, 100))
+
+    def test_batch_counts_how_each_download_ended(self):
+        self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
+        with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"):
+            self.run_worker(vault.normalize(entry(name="Game", sha256="")))
+        self.assertEqual(self.store.batch_progress()["saved"], 1)
+        with mock.patch.object(self.store, "_download", side_effect=OSError("offline")):
+            self.run_worker(vault.normalize(entry(id="two", name="Two", sha256="")))
+        with mock.patch.object(self.store, "_download", side_effect=vault.Cancelled):
+            self.run_worker(vault.normalize(entry(id="three", name="Three", sha256="")))
+        progress = self.store.batch_progress()
+        self.assertEqual((progress["failed"], progress["cancelled"]), (0, 1))
 
     def test_mod_name_is_saved(self):
         self.store.set_mod_name("Bản A")
@@ -726,6 +781,8 @@ class NormalizeTests(unittest.TestCase):
         self.scan()
         self.store.normalize_mods()
         self.assertFalse((self.src / "outer").exists())
+        self.assertTrue((self.dest / "backup" / "outer" / "inner" / "Game.zip").exists())
+        self.assertTrue((self.dest / "backup" / "outer" / "other" / "notes.txt").exists())
         self.assertTrue((self.src / "elsewhere" / "notes.txt").exists())
 
     def test_keeps_the_outermost_folder_while_a_mod_in_it_is_unfinished(self):
@@ -734,6 +791,7 @@ class NormalizeTests(unittest.TestCase):
         self.scan()
         self.store.normalize_mods()
         self.assertFalse(first.exists())
+        self.assertTrue((self.dest / "backup" / "outer" / "Game.zip").exists())
         self.assertTrue(broken.exists())
 
     def test_reports_zips_that_cannot_be_used(self):
@@ -762,6 +820,87 @@ class NormalizeTests(unittest.TestCase):
         self.assertTrue((self.base / "Game - [VI]" / "[miss-unreviewed] [VI].zip").exists())
         self.assertFalse((self.src / "outer").exists())
         self.assertTrue(self.src.exists())
+
+    def test_backup_keeps_the_bytes_of_a_loose_mod(self):
+        self.loose(f"Game/atmosphere/contents/{TITLE}/romfs/a.bin", b"payload")
+        self.scan()
+        self.store.normalize_mods()
+        saved = self.dest / "backup" / "Game" / "atmosphere" / "contents" / TITLE / "romfs" / "a.bin"
+        self.assertEqual(saved.read_bytes(), b"payload")
+
+    def test_backup_never_overwrites_an_earlier_backup(self):
+        first = self.dest / "backup" / "Game.zip"
+        first.parent.mkdir(parents=True)
+        first.write_bytes(b"old")
+        self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
+        self.scan()
+        self.store.normalize_mods()
+        self.assertEqual(first.read_bytes(), b"old")
+        self.assertTrue((self.dest / "backup" / "Game (2).zip").exists())
+
+    def test_rejects_a_source_inside_the_backup_folder(self):
+        (self.dest / "backup" / "old").mkdir(parents=True)
+        self.store.scan_mods(str(self.dest / "backup" / "old"), str(self.dest))
+        self.assertTrue(self.store.normalize_job["failed"])
+
+    def test_failed_backup_is_reported_and_keeps_the_source(self):
+        source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
+        self.scan()
+        with mock.patch.object(vault.shutil, "move", side_effect=OSError("full")):
+            self.store.normalize_mods()
+        self.assertTrue(source.exists())
+        self.assertIn("backup", self.store.normalize_job["plans"][0]["message"])
+
+    def test_mods_of_one_game_keep_their_own_names(self):
+        self.zip_file("[60FPS] - Game/[1.1.1-v262144] [60FPS].zip", {f"contents/{TITLE}/exefs/main": b"1"})
+        self.zip_file("[VI] - Game/[1.1.1-v262144] [VI].zip", {f"contents/{TITLE}/romfs/a.bin": b"2"})
+        self.store.set_mod_name("Khác")
+        plans = self.scan()
+        self.assertEqual([plan["status"] for plan in plans], ["ready", "ready"])
+        self.assertEqual({plan["target"] for plan in plans},
+                         {self.dest / "Game - [60FPS]" / "[1.1.1-v262144] [60FPS].zip",
+                          self.dest / "Game - [VI]" / "[1.1.1-v262144] [VI].zip"})
+
+    def test_keeps_the_internal_version_a_source_gives(self):
+        version = vault.internal_version
+        self.assertEqual(version("zip", self.src / "[v1.6.15-v1310720] [VI].zip", self.src, "v1.6.15"), "v1310720")
+        self.assertEqual(version("zip", self.src / "[1.1.1-v262144]/Mod.zip", self.src, "1.1.1"), "v262144")
+        self.assertEqual(version("zip", self.src / "[v1.1.0-v65536] [VI].zip", self.src, "1.1.0"), "v65536")
+
+    def test_internal_version_falls_back_to_unreviewed(self):
+        version = vault.internal_version
+        self.assertEqual(version("zip", self.src / "Game 1.0.zip", self.src, "1.0"), "unreviewed")
+        self.assertEqual(version("zip", self.src / "[1.1.1-v262144] [VI].zip", self.src, "2.0"), "unreviewed")
+
+    def test_two_internal_versions_of_a_game_do_not_clash(self):
+        self.zip_file("a/[1.0-v1] [VI].zip", {f"{TITLE}/romfs/a.bin": b"1"})
+        self.zip_file("b/[1.0-v2] [VI].zip", {f"{TITLE}/romfs/a.bin": b"2"})
+        self.assertEqual([plan["status"] for plan in self.scan()], ["ready", "ready"])
+
+    def test_copied_file_with_an_internal_version_matches_the_game_version(self):
+        item = self.destination_item()
+        self.place(item, "[1.0-v262144] [VI].zip")
+        self.assertEqual(self.store.status_of(item), "ok")
+
+    def test_reads_the_mod_name_from_a_source(self):
+        name = vault.source_mod_name
+        for kind, relative, expected in (("zip", "a/[1.0-v1] [60FPS].zip", "60FPS"),
+                                         ("zip", "[VI-Characters] Stardew valley/[v1.6-v2] x.zip", "VI-Characters"),
+                                         ("zip", "Game - [Bản A]/x.zip", "Bản A"),
+                                         ("folder", f"[60FPS] - Game/atmosphere/contents/{TITLE}", "60FPS"),
+                                         ("zip", "[1.0.0-unreviewed].zip", ""), ("zip", "[miss-unreviewed].zip", ""),
+                                         ("zip", "[Pokemon]/Game.zip", ""), ("zip", "Game.zip", "")):
+            self.assertEqual(name(kind, self.src / relative, self.src), expected, relative)
+
+    def test_source_without_a_name_uses_the_mod_name_field(self):
+        self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
+        self.assertEqual(self.scan()[0]["mod"], "VI")
+
+    def test_plan_knows_the_size_on_disk(self):
+        source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1" * 5000})
+        self.loose(f"Two/{OTHER_TITLE}/romfs/b.bin", b"2" * 500)
+        stored = {plan["name"]: (plan["stored"], plan["size"]) for plan in self.scan()}
+        self.assertEqual(stored, {"Game": (source.stat().st_size, 5000), "Two": (500, 500)})
 
     def test_cancelling_keeps_unfinished_sources(self):
         source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
