@@ -114,9 +114,109 @@ def https_or_empty(value):
     return ""
 
 
-def resolve_urls(raw):
-    urls = [https_or_empty(raw.get("url"))]
-    for mirror in raw.get("mirrors") or []:
+# The canonical fields PatchVault works with, and the source keys we recognise for each
+# without being told. Catalogs from different projects name the same thing differently
+# (English, Vietnamese, nested under a files array), so we try each alias in turn. A field
+# mapping supplied per catalog overrides this. Dotted aliases dig into nested dicts/lists,
+# e.g. "files.0.url" reads the first file's url. The first alias of each field is the key
+# PatchVault's own catalogs use, so a catalog with no surprises parses exactly as before.
+FIELD_ALIASES = {
+    "id": ["id", "slug", "key", "ma", "ma_game", "game_id"],
+    "name": ["name", "title", "ten_game", "ten", "game_name"],
+    "title_id": ["title_id", "titleid", "tid", "title_id_game", "ma_tua"],
+    "version": ["mod_version", "version", "phien_ban", "ver", "mod_ver"],
+    "game_version": ["game_version", "phien_ban_game", "phien_ban_yeu_cau", "game_ver"],
+    "sha256": ["sha256", "sha", "hash", "checksum", "sha_256",
+               "files.0.sha256", "tap_tin.0.sha256", "file.sha256"],
+    "size": ["size", "dung_luong", "dung_luong_tap_tin", "filesize", "file_size", "bytes",
+             "files.0.size", "tap_tin.0.dung_luong", "file.size"],
+    "url": ["url", "download", "download_url", "link", "tai_ve", "duong_dan",
+            "files.0.url", "tap_tin.0.tai_ve", "tap_tin.0.url", "file.url"],
+    "mirrors": ["mirrors", "mirror", "links", "guong"],
+    "cover": ["cover", "cover_url", "image", "thumbnail", "anh", "anh_bia", "poster"],
+    "background": ["background", "banner", "anh_nen", "bg"],
+    "tagline": ["tagline", "slogan", "mo_ta_ngan"],
+    "developer": ["developer", "dev", "nha_phat_trien", "studio"],
+    "release": ["release", "release_date", "ngay_phat_hanh"],
+    "translator": ["translator", "nguoi_dich", "dich_gia", "nhom_dich"],
+    "tags": ["tags", "genres", "the_loai", "ten_the_loai", "categories", "danh_muc"],
+    "description": ["description", "desc", "mo_ta"],
+    "highlights": ["highlights", "diem_noi_bat"],
+    "done": ["done", "da_lam"],
+    "kept": ["kept", "giu_lai"],
+    "changelog": ["changelog", "lich_su", "ghi_chu"],
+    "credit": ["credit", "credits", "cam_on"],
+}
+# Keys whose value is the array of games. Checked in order; a top-level JSON array is used
+# as-is. "__root__" in a mapping overrides this.
+ROOT_ALIASES = ["mods", "games", "items", "data", "list", "catalog", "patches", "danh_sach"]
+# Fields the "advanced" panel of the catalog dialog lets the user map by hand.
+MAPPABLE_FIELDS = [
+    ("__root__", "Mảng game (gốc)"), ("id", "Mã (id)"), ("name", "Tên game"),
+    ("title_id", "Title ID"), ("version", "Phiên bản việt hoá"), ("game_version", "Phiên bản game"),
+    ("url", "Link tải"), ("sha256", "SHA-256"), ("size", "Dung lượng"), ("cover", "Ảnh bìa"),
+]
+
+
+def dig(obj, path):
+    """Follow a dotted path through dicts and lists, returning None if any step is missing."""
+    for part in str(path).split("."):
+        if isinstance(obj, dict):
+            obj = obj.get(part)
+        elif isinstance(obj, list) and part.lstrip("-").isdigit() and -len(obj) <= int(part) < len(obj):
+            obj = obj[int(part)]
+        else:
+            return None
+        if obj is None:
+            return None
+    return obj
+
+
+def pick(raw, field, mapping):
+    """Read one canonical field: an explicit mapping wins, otherwise try the known aliases."""
+    if mapping and mapping.get(field):
+        return dig(raw, mapping[field])
+    for alias in FIELD_ALIASES.get(field, [field]):
+        value = dig(raw, alias)
+        if value is not None:
+            return value
+    return None
+
+
+def as_text(value):
+    return str(value) if isinstance(value, (str, int, float)) and not isinstance(value, bool) else ""
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def as_size(value):
+    """Coerce a size that may arrive as an int, float, or a string like "1,234"."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = re.sub(r"[,\s_]", "", value)
+        if text.isdigit():
+            return int(text)
+    return 0
+
+
+def clean_mapping(mapping):
+    """Keep only the non-empty overrides, so an untouched advanced panel means pure heuristic."""
+    if not isinstance(mapping, dict):
+        return {}
+    return {field: key.strip() for field, key in mapping.items()
+            if isinstance(key, str) and key.strip()}
+
+
+def resolve_urls(primary, mirrors):
+    urls = [https_or_empty(primary)]
+    for mirror in as_list(mirrors):
         if isinstance(mirror, str) and mirror.startswith("gdrive:"):
             file_id = mirror[len("gdrive:"):]
             if SAFE_GDRIVE.match(file_id):
@@ -126,63 +226,85 @@ def resolve_urls(raw):
     return [url for url in dict.fromkeys(urls) if url]
 
 
-def normalize(raw):
-    """Validate one catalog entry. The catalog is remote data, so nothing in it is trusted."""
+def normalize(raw, mapping=None):
+    """Turn one catalog entry into PatchVault's own shape. The catalog is remote data, so
+    nothing in it is trusted. An id and at least one https download are required; everything
+    else, SHA-256 and size included, is optional and features degrade when it is absent."""
     if not isinstance(raw, dict):
         return None
-    entry_id = raw.get("id")
-    sha = raw.get("sha256")
-    size = raw.get("size")
-    urls = resolve_urls(raw)
-    if not (isinstance(entry_id, str) and SAFE_ID.match(entry_id)):
+    get = lambda field: pick(raw, field, mapping)
+    name = as_text(get("name")).strip()
+    raw_id = get("id")
+    # A catalog keyed only by name gets an id derived from it; an id that is present but
+    # unsafe is rejected rather than papered over.
+    entry_id = art_slug(name)[:64] if raw_id is None else as_text(raw_id).strip()
+    if not SAFE_ID.match(entry_id):
         return None
-    if not (isinstance(sha, str) and SAFE_SHA.match(sha)):
+    urls = resolve_urls(get("url"), get("mirrors"))
+    if not urls:
         return None
-    if not (isinstance(size, int) and size > 0) or not urls:
-        return None
+    sha = as_text(get("sha256")).strip().lower()
+    sha = sha if SAFE_SHA.match(sha) else ""
+    size = max(0, as_size(get("size")))
     return {
         "id": entry_id,
-        "name": str(raw.get("name") or entry_id),
-        "version": str(raw.get("mod_version") or ""),
-        "game_version": str(raw.get("game_version") or ""),
-        "title_id": str(raw.get("title_id") or ""),
-        "tagline": str(raw.get("tagline") or ""),
-        "developer": str(raw.get("developer") or ""),
-        "release": str(raw.get("release") or ""),
-        "translator": str(raw.get("translator") or ""),
-        "tags": [str(tag) for tag in raw.get("tags") or []],
-        "description": [str(line) for line in raw.get("description") or []],
-        "highlights": [{"title": str(entry.get("title") or ""), "text": str(entry.get("text") or "")}
-                       for entry in raw.get("highlights") or [] if isinstance(entry, dict)],
-        "done": [str(line) for line in raw.get("done") or []],
-        "kept": [str(line) for line in raw.get("kept") or []],
-        "changelog": str(raw.get("changelog") or ""),
-        "credit": str(raw.get("credit") or ""),
-        "cover": https_or_empty(raw.get("cover")),
-        "background": https_or_empty(raw.get("background")),
-        "sha256": sha.lower(),
+        "name": name or entry_id,
+        "version": as_text(get("version")),
+        "game_version": as_text(get("game_version")),
+        "title_id": as_text(get("title_id")),
+        "tagline": as_text(get("tagline")),
+        "developer": as_text(get("developer")),
+        "release": as_text(get("release")),
+        "translator": as_text(get("translator")),
+        "tags": [as_text(tag) for tag in as_list(get("tags")) if as_text(tag)],
+        "description": [as_text(line) for line in as_list(get("description"))],
+        "highlights": [{"title": as_text(dig(entry, "title")), "text": as_text(dig(entry, "text"))}
+                       for entry in as_list(get("highlights")) if isinstance(entry, dict)],
+        "done": [as_text(line) for line in as_list(get("done"))],
+        "kept": [as_text(line) for line in as_list(get("kept"))],
+        "changelog": as_text(get("changelog")),
+        "credit": as_text(get("credit")),
+        "cover": https_or_empty(get("cover")),
+        "background": https_or_empty(get("background")),
+        "sha256": sha,
         "size": size,
         "urls": urls,
     }
 
 
-def fetch_catalog(url):
+def find_rows(data, mapping):
+    """Locate the array of games: a mapped key, a known wrapper key, or a bare top-level list."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return None
+    if mapping and mapping.get("__root__"):
+        rows = dig(data, mapping["__root__"])
+        return rows if isinstance(rows, list) else None
+    for key in ROOT_ALIASES:
+        if isinstance(data.get(key), list):
+            return data[key]
+    return None
+
+
+def fetch_catalog(url, mapping=None):
     """Return the raw bytes and parsed items of the catalog at url."""
     separator = "&" if "?" in url else "?"
     with http_get(f"{url}{separator}t={int(time.time())}") as response:
         raw = response.read(MAX_CATALOG + 1)
     if len(raw) > MAX_CATALOG:
         raise ValueError("catalog quá lớn")
-    return raw, parse_catalog(json.loads(raw))
+    return raw, parse_catalog(json.loads(raw), mapping)
 
 
-def parse_catalog(data):
-    if not isinstance(data, dict):
+def parse_catalog(data, mapping=None):
+    rows = find_rows(data, mapping)
+    if rows is None:
         raise ValueError("file không phải catalog")
     items = []
     seen = set()
-    for raw in data.get("mods") or []:
-        entry = normalize(raw)
+    for raw in rows:
+        entry = normalize(raw, mapping)
         if entry and entry["id"] not in seen:
             seen.add(entry["id"])
             items.append(entry)
@@ -485,7 +607,8 @@ class Vault:
         self.checked_at = None
         self.check_error = None
         try:
-            self.items = parse_catalog(json.loads(self.cache_path.read_bytes()))
+            mapping = clean_mapping(catalog.get("mapping")) if catalog else None
+            self.items = parse_catalog(json.loads(self.cache_path.read_bytes()), mapping)
         except (OSError, ValueError):
             pass
 
@@ -493,15 +616,18 @@ class Vault:
         active = self.catalog["folder"] if self.catalog else None
         self._write_json(self.registry_path, {"active": active, "catalogs": self.catalogs})
 
-    def add_catalog(self, name, url):
-        """Add a catalog after confirming that the URL really serves one, then switch to it."""
+    def add_catalog(self, name, url, mapping=None):
+        """Add a catalog after confirming that the URL really serves one, then switch to it.
+        An optional field mapping tells the parser how to read a catalog whose keys the
+        heuristics do not recognise."""
         url = url.strip()
         if not url.startswith("https://"):
             raise ValueError("URL phải bắt đầu bằng https://")
+        mapping = clean_mapping(mapping)
         with self.lock:
             if any(catalog["url"] == url for catalog in self.catalogs):
                 raise ValueError("catalog này đã có trong danh sách")
-        raw, _ = fetch_catalog(url)
+        raw, _ = fetch_catalog(url, mapping)
         name = name.strip() or urlsplit(url).hostname or "catalog"
         with self.lock:
             if self.busy():
@@ -511,7 +637,7 @@ class Vault:
             folder, number = slug, 2
             while folder in taken:
                 folder, number = f"{slug}-{number}", number + 1
-            catalog = {"name": name, "url": url, "folder": folder}
+            catalog = {"name": name, "url": url, "folder": folder, "mapping": mapping}
             self.catalogs.append(catalog)
             self._write_bytes(self.catalogs_dir / f"{folder}.json", raw)
             self._use_catalog(catalog)
@@ -556,7 +682,7 @@ class Vault:
             self.checking = True
             catalog = self.catalog
         try:
-            raw, items = fetch_catalog(catalog["url"])
+            raw, items = fetch_catalog(catalog["url"], clean_mapping(catalog.get("mapping")))
             with self.lock:
                 # The user may have switched catalogs while this one was loading.
                 if self.catalog is catalog:
@@ -658,7 +784,11 @@ class Vault:
         path = self.local_path(record) if record else None
         if path is None or not path.is_file():
             return "missing"
-        return "ok" if record["sha256"] == entry["sha256"] else "update"
+        # The original file's SHA-256 is the surest way to spot a new release. When the
+        # catalog does not carry one, fall back to comparing the version it reports.
+        if entry["sha256"] and record.get("sha256"):
+            return "ok" if record["sha256"] == entry["sha256"] else "update"
+        return "ok" if record.get("version", "") == entry["version"] else "update"
 
     def snapshot(self):
         with self.lock:
@@ -712,11 +842,12 @@ class Vault:
 
     def _fetch(self, entry, url, part, cancel):
         """Download url into part, resuming when the server supports ranges."""
+        size = entry["size"]  # 0 means the catalog did not say, so size checks are skipped
         have = part.stat().st_size if part.exists() else 0
-        if have > entry["size"]:
+        if size and have > size:
             part.unlink()
             have = 0
-        if have == entry["size"]:
+        if size and have == size:
             return
         headers = {"Range": f"bytes={have}-"} if have else {}
         try:
@@ -737,7 +868,7 @@ class Vault:
                     if not block:
                         break
                     done += len(block)
-                    if done > entry["size"]:
+                    if size and done > size:
                         raise ValueError("file lớn hơn kích thước trong catalog")
                     handle.write(block)
                     now = time.monotonic()
@@ -746,13 +877,13 @@ class Vault:
                                          speed=(done - mark_done) / (now - mark))
                         mark, mark_done = now, done
                 self._update_job(entry["id"], done=done)
-            if done < entry["size"]:
+            if size and done < size:
                 raise OSError("kết nối bị ngắt giữa chừng")
 
     def _download(self, entry, cancel):
         """Return the path of a verified copy of the original file."""
         self.parts.mkdir(exist_ok=True)
-        part = self.parts / f"{entry['id']}.{entry['sha256'][:12]}.part"
+        part = self.parts / f"{entry['id']}.{(entry['sha256'] or 'nohash')[:12]}.part"
         last_error = "không tải được"
         for url in entry["urls"]:
             for attempt in range(RETRIES):
@@ -767,6 +898,10 @@ class Vault:
                 except (OSError, ValueError, http.client.HTTPException) as error:
                     last_error = str(error) or type(error).__name__
                 else:
+                    # With no SHA-256 in the catalog there is nothing to verify against, so a
+                    # completed download is accepted as-is.
+                    if not entry["sha256"]:
+                        return part
                     self._update_job(entry["id"], phase="verifying", speed=0)
                     if sha256_of(part) == entry["sha256"]:
                         return part
@@ -840,9 +975,10 @@ def status_text(item):
         if job["phase"] == "error":
             return "Lỗi"
         if job["phase"] == "downloading":
-            percent = 100 * job["done"] / job["total"]
             speed = f" · {format_size(job['speed'])}/s" if job["speed"] else ""
-            return f"{percent:.0f}%{speed}"
+            if job["total"]:
+                return f"{100 * job['done'] / job['total']:.0f}%{speed}"
+            return f"{format_size(job['done'])}{speed}"  # size unknown: show bytes pulled so far
         return {"queued": "Đang chờ", "verifying": "Đang kiểm tra", "repacking": "Đang đóng gói"}[job["phase"]]
     if item["status"] == "update":
         return f"Cập nhật: {item['local_version'] or '?'} → {item['version'] or 'mới'}"
@@ -1622,8 +1758,8 @@ class CatalogManager:
         self.result = None
         self.window = tk.Toplevel(app.root, bg=COLORS["bg"])
         self.window.title("Quản lý catalog")
-        self.window.geometry("640x400")
-        self.window.minsize(520, 340)
+        self.window.geometry("640x430")
+        self.window.minsize(520, 360)
         self.window.transient(app.root)
         frame = ttk.Frame(self.window, padding=14)
         frame.pack(fill="both", expand=True)
@@ -1644,17 +1780,56 @@ class CatalogManager:
         url_entry = ttk.Entry(frame, textvariable=self.url)
         url_entry.grid(row=3, column=1, sticky="ew", pady=3)
         url_entry.bind("<Return>", lambda _: self.add())
-        self.status = ttk.Label(frame, style="Muted.TLabel", wraplength=460, justify="left")
-        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Advanced panel: an optional map from PatchVault's fields to this catalog's own keys,
+        # for a JSON shape the heuristics do not recognise. Blank = pure auto-detect.
+        self.advanced = tk.BooleanVar(value=False)
+        self.toggle = tk.Checkbutton(frame, variable=self.advanced,
+                                     command=self.toggle_advanced, bg=COLORS["bg"], fg=COLORS["muted"],
+                                     activebackground=COLORS["bg"], activeforeground=COLORS["ink"],
+                                     selectcolor=COLORS["field"], bd=0, highlightthickness=0,
+                                     font=app.font, anchor="w", text="Ánh xạ trường (nâng cao)")
+        self.toggle.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.fields = {}
+        self.panel = ttk.Frame(frame)
+        self.panel.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.panel.columnconfigure(1, weight=1)
+        self.panel.columnconfigure(3, weight=1)
+        ttk.Label(self.panel, wraplength=560, justify="left", style="Muted.TLabel",
+                  text="Để trống = tự dò. Điền tên khoá trong JSON của catalog; có thể dùng dấu "
+                       "chấm để vào mảng con, ví dụ files.0.url.").grid(row=0, column=0, columnspan=4,
+                                                                        sticky="w", pady=(0, 6))
+        for index, (field, label) in enumerate(MAPPABLE_FIELDS):
+            var = tk.StringVar()
+            self.fields[field] = var
+            row, column = 1 + index // 2, (index % 2) * 2
+            ttk.Label(self.panel, text=label, style="Muted.TLabel").grid(
+                row=row, column=column, sticky="w", padx=(0, 8), pady=2)
+            ttk.Entry(self.panel, textvariable=var, width=16).grid(
+                row=row, column=column + 1, sticky="ew", padx=(0, 12), pady=2)
+        self.panel.grid_remove()
+
+        self.status = ttk.Label(frame, style="Muted.TLabel", wraplength=560, justify="left")
+        self.status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.add_button = ttk.Button(frame, text="Thêm catalog", style="Accent.TButton", command=self.add)
-        self.add_button.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        self.add_button.grid(row=7, column=0, columnspan=2, sticky="e", pady=(8, 0))
         self.fill_list()
         url_entry.focus_set()
+
+    def toggle_advanced(self):
+        if self.advanced.get():
+            self.panel.grid()
+        else:
+            self.panel.grid_remove()
+
+    def current_mapping(self):
+        return {field: var.get() for field, var in self.fields.items() if var.get().strip()}
 
     def fill_list(self):
         self.listbox.delete(0, "end")
         for catalog in self.vault.catalogs:
-            self.listbox.insert("end", f"{catalog['name']}  ·  {catalog['url']}")
+            marker = "  ⚙" if catalog.get("mapping") else ""
+            self.listbox.insert("end", f"{catalog['name']}  ·  {catalog['url']}{marker}")
         self.paint_buttons()
 
     def paint_buttons(self):
@@ -1665,13 +1840,14 @@ class CatalogManager:
             return
         self.add_button.state(["disabled"])
         self.status.configure(text="Đang đọc catalog…", style="Muted.TLabel")
-        threading.Thread(target=self.run_add, args=(self.name.get(), self.url.get()), daemon=True).start()
+        threading.Thread(target=self.run_add, args=(self.name.get(), self.url.get(), self.current_mapping()),
+                         daemon=True).start()
         self.window.after(150, self.wait_for_add)
 
-    def run_add(self, name, url):
+    def run_add(self, name, url, mapping):
         try:
-            catalog = self.vault.add_catalog(name, url)
-            self.result = ("ok", f"Đã thêm {catalog['name']}.")
+            catalog = self.vault.add_catalog(name, url, mapping)
+            self.result = ("ok", f"Đã thêm {catalog['name']} ({len(self.vault.items)} game).")
         except (OSError, ValueError, http.client.HTTPException) as error:
             self.result = ("error", str(error) or type(error).__name__)
 
@@ -1688,6 +1864,8 @@ class CatalogManager:
         if state == "ok":
             self.name.set("")
             self.url.set("")
+            for var in self.fields.values():
+                var.set("")
             self.fill_list()
 
     def remove(self):

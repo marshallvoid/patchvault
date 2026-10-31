@@ -149,7 +149,8 @@ class CatalogTests(unittest.TestCase):
     def test_rejects_unsafe_entries(self):
         self.assertIsNone(vault.normalize(entry(id="../x")))
         self.assertIsNone(vault.normalize(entry(url="http://example.com/a.zip")))
-        self.assertIsNone(vault.normalize(entry(sha256="abc")))
+        # A bad or missing hash no longer rejects the entry; verification simply degrades.
+        self.assertEqual(vault.normalize(entry(sha256="abc"))["sha256"], "")
 
     def test_resolves_gdrive_mirrors(self):
         item = vault.normalize(entry(mirrors=["gdrive:abcdefghij1234"]))
@@ -229,6 +230,57 @@ class RepackTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     vault.repack(self.zip_with(members), target, TITLE)
                 self.assertFalse(target.exists())
+
+
+class FlexibleCatalogTests(unittest.TestCase):
+    def test_heuristic_reads_alternative_keys(self):
+        raw = {"games": [{"title": "Trò Chơi", "download": "https://x.test/a.zip",
+                          "phien_ban": "1.2", "the_loai": ["RPG"]}]}
+        item = vault.parse_catalog(raw)[0]
+        self.assertEqual(item["name"], "Trò Chơi")
+        self.assertEqual(item["urls"], ["https://x.test/a.zip"])
+        self.assertEqual(item["version"], "1.2")
+        self.assertEqual(item["tags"], ["RPG"])
+        self.assertEqual(item["id"], "tro-choi")  # derived from the name when no id is given
+
+    def test_top_level_list_is_a_catalog(self):
+        self.assertEqual(len(vault.parse_catalog([{"name": "A", "url": "https://x.test/a.zip"}])), 1)
+
+    def test_nested_file_fields(self):
+        raw = {"mods": [{"id": "g", "name": "G",
+                         "files": [{"url": "https://x.test/a.zip", "sha256": "a" * 64, "size": 10}]}]}
+        item = vault.parse_catalog(raw)[0]
+        self.assertEqual((item["urls"], item["sha256"], item["size"]), (["https://x.test/a.zip"], "a" * 64, 10))
+
+    def test_manual_mapping_overrides_everything(self):
+        raw = {"payload": [{"slug": "pack1", "tenGame": "Game", "tai": "https://x.test/a.zip"}]}
+        mapping = {"__root__": "payload", "id": "slug", "name": "tenGame", "url": "tai"}
+        item = vault.parse_catalog(raw, mapping)[0]
+        self.assertEqual((item["id"], item["name"], item["urls"]), ("pack1", "Game", ["https://x.test/a.zip"]))
+
+    def test_size_accepts_a_formatted_string(self):
+        self.assertEqual(vault.normalize({"id": "g", "url": "https://x.test/a.zip", "size": "1,234"})["size"], 1234)
+
+    def test_optional_fields_default_safely(self):
+        item = vault.normalize({"id": "g", "url": "https://x.test/a.zip"})
+        self.assertEqual((item["sha256"], item["size"], item["title_id"]), ("", 0, ""))
+
+    def test_clean_mapping_drops_blanks(self):
+        self.assertEqual(vault.clean_mapping({"id": " slug ", "name": "", "url": None}), {"id": "slug"})
+
+
+class VersionFallbackTests(unittest.TestCase):
+    def test_update_detection_falls_back_to_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = vault.Vault(folder)
+            item = vault.normalize({"id": "g", "name": "G", "url": "https://x.test/a.zip",
+                                    "mod_version": "1.0", "title_id": TITLE})
+            target = store.root / vault.target_path(item)
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"zip")
+            store._commit(item, target)
+            self.assertEqual(store.status_of(item), "ok")
+            self.assertEqual(store.status_of({**item, "version": "1.1"}), "update")
 
 
 class StatusTests(unittest.TestCase):
