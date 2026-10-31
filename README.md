@@ -1,29 +1,65 @@
 # PatchVault
 
-A desktop app that downloads, tracks and repackages Vietnamese translation patches for Nintendo
-Switch games from remote catalogs that you add yourself.
+A desktop app that downloads, tracks and repackages game mods from remote catalogs that you add
+yourself, and tidies the mods you already have into the same layout. It works with any mod,
+whatever its language or purpose.
 
 ## Features
 
 - Add several catalogs by URL and switch between them from the app.
-- Verifies the SHA-256 of every download, resumes interrupted transfers and falls back to mirrors.
-- Detects updates, even after a patch has been repackaged.
+- Pick several games, or all of them, and stop every download at once.
+- Resumes interrupted transfers, falls back to mirrors and verifies the SHA-256 when the catalog
+  has one.
+- Detects updates, even after a mod has been repackaged.
 - Updates itself from GitHub releases.
-- Repackages every patch into one consistent layout:
+- Repackages every mod into one consistent layout, with Deflate at level 9:
 
 ```
 downloaded/
 └── <catalog>/
-    └── [VI] - <Game name>/
-        └── [<game version>-unreviewed] [VI].zip
+    └── <Game name> - [<mod name>]/
+        └── [<game version>-unreviewed] [<mod name>].zip
             └── contents/<title id>/...
 ```
 
-Games with no version in the catalog use `miss`. Files outside the title ID folder, such as
-instructions, are not kept in the new zip.
-
 Catalogs are not signed, so a catalog decides what you download. Only add catalogs you trust. No
 catalog is included with the app.
+
+## Naming
+
+You enter the mod name once at the top of the window, and it is required before downloading or
+normalizing. It can be anything, such as the language or the author of the mod.
+
+Game names come from [titledb](https://github.com/blawar/titledb), then from a catalog listing the
+title ID, and when normalizing, from the file name. The database is about 90 MB, downloaded once
+and refreshed weekly. In paths and in the app, game names keep only letters, digits, spaces and
+hyphens, and all-capitals names become Title Case. A game with no known version uses `miss`.
+
+Only the title ID folders are kept, so instructions and other files around them are dropped. A
+pack with several title IDs, such as a game and a system font, stays one zip named after the game.
+
+## Downloading
+
+Choose **Thư mục đích** in the **Tải mod** tab to save mods as `<folder>/<catalog>/...` instead of
+`downloaded/<catalog>/...`. The folder is remembered between runs.
+
+A game counts as downloaded when its `<Game name> - [<mod name>]` folder in the download folder in
+use holds a zip, so files moved in by hand work and other folders do not count. In the list,
+Ctrl+click, Shift+click and Ctrl+A pick several games for **Tải đã chọn**.
+
+## Normalizing existing mods
+
+The **Chuẩn hóa mod** tab takes a source folder and a destination folder. The source can have any
+structure: the app finds every zip and every folder of title IDs in it. **Quét** only shows what
+would happen, and **Chuẩn hóa** then saves each mod as:
+
+```
+<destination>/<Game name> - [<mod name>]/[<game version>-unreviewed] [<mod name>].zip
+```
+
+Once every mod in a top-level folder of the source is saved, that whole folder is deleted, including
+anything else in it. A folder with a failed or skipped mod stays, and existing files are never
+overwritten. The destination can contain the source, but not the other way round.
 
 ## Install
 
@@ -31,7 +67,7 @@ Download the zip for your platform from [Releases](../../releases) and extract i
 
 ```
 PatchVault          # .exe on Windows, .app on macOS
-downloaded/         # finished patches
+downloaded/         # finished mods
 covers/             # cached artwork
 ```
 

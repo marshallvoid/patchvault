@@ -39,7 +39,18 @@ The file is layered top to bottom:
 - **Repackaging** (`plan_repack`, `repack`). Rewrites a downloaded zip into the layout described in
   the README, enforcing limits such as `MAX_UNPACKED`.
 - **`Vault`**. All state and logic, with no Tkinter dependency, which is what the tests exercise.
-- **`App`, `GameRow`, `CatalogManager`**. The Tkinter UI.
+- **Normalizing** (`plan_mods`, `Vault.scan_mods`, `Vault.normalize_mods`). Reuses `plan_repack`, `repack` and
+  `normalized_path` for mods already on disk. Planning never touches the disk, so the UI can show a
+  review first. Sources are deleted only after every title in them is saved, a top-level source folder only
+  after every mod in it is saved, and targets are never overwritten. Game names come from titledb
+  (`Vault.title_names`), cached in `.catalogs/_titles.json`. Downloads and normalizing share
+  `normalized_path` and one mod name, `Vault.mod_name`, saved in `.catalogs/index.json`
+  with both destination folders. `status_of` looks for zips in the game's folder under `Vault.root`
+  (the destination, or the default) in both cases and uses the record only to identify the release.
+- **Game names**. `Vault._named` replaces each item's `name` with the titledb name and keeps the
+  original as `catalog_name`, so anything using `name` gets the official one.
+- **`App`, `GameRow`, `CatalogManager`, `NormalizeTab`**. The Tkinter UI. Both tabs show their log
+  through `LogPane` and `ViewSwitch`; logs live in `Vault` and last for the session.
 
 ### Threading
 

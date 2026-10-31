@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PatchVault: download, track and repackage Vietnamese patches for Switch games.
+"""PatchVault: download, track and repackage game mods.
 
 Needs Python 3.8+ with Tkinter; Pillow is optional and enables artwork. Catalogs are added
 from the app window, and each one keeps its own downloads, artwork and state.
 
 Every patch is repackaged as
-    downloaded/<catalog>/[VI] - <Game name>/[<game version>-unreviewed] [VI].zip
+    downloaded/<catalog>/<Game name> - [<mod name>]/[<game version>-unreviewed] [<mod name>].zip
 with a contents/<title id>/... layout (Deflate, level 9).
 
     python3 patchvault.py            open the app window
@@ -36,7 +36,7 @@ from urllib.parse import urlsplit
 
 try:
     import tkinter as tk
-    from tkinter import font as tkfont, messagebox, ttk
+    from tkinter import filedialog, font as tkfont, ttk
 except ImportError:
     tk = None
 
@@ -53,7 +53,6 @@ WORKERS = 2
 ART_WORKERS = 4
 RETRIES = 3
 CHUNK = 256 * 1024
-MOD_TAG = "VI"
 INTERNAL_VERSION = "unreviewed"
 MISSING_VERSION = "miss"
 MAX_UNPACKED = 32 * 1024 ** 3
@@ -61,15 +60,21 @@ MAX_IMAGE = 8 * 1024 * 1024
 MAX_CATALOG = 32 * 1024 * 1024
 CATALOGS_DIR = ".catalogs"
 MAX_UPDATE = 300 * 1024 * 1024
+TITLES_URL = "https://raw.githubusercontent.com/blawar/titledb/master/US.en.json"
+TITLES_FILE = "_titles.json"
+TITLES_MAX_AGE = 7 * 24 * 3600
+FIRST_GAME_TITLE = 0x0100000000010000
+MAX_TITLES = 400 * 1024 * 1024
 PROGRAM_NAME = "PatchVault"
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 ART_KINDS = ("cover", "background")
 DOWNLOAD_DIR = "downloaded"
-SKIPPED_OUTSIDE = (".txt", ".md", ".url", ".pdf", ".htm", ".html")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
 CONFIG_KEYS = ("PATCHVAULT_RELEASES_URL",)
 VERSION_KEY = "PATCHVAULT_VERSION"
+ROMAN_NUMERAL = re.compile(r"(?=[IVX])X{0,3}(?:IX|IV|V?I{0,3})")
+WRAPPER_NAMES = {"atmosphere", "contents", "titles", "mods", "mod", "switch", "sdcard"}
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_SHA = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -78,6 +83,9 @@ TITLE_ID = re.compile(r"^[0-9A-Fa-f]{16}$")
 ASSET_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 DISPLAY_VERSION = re.compile(r"v?\d+(?:\.\d+)*")
+# File names hold words like "2" or "1080p", so only 1.2 or v2 count as a version here.
+VERSION_IN_NAME = re.compile(r"(?<![^\W_])(?:v?\d+(?:\.\d+)+|v\d+)(?![^\W_])", re.IGNORECASE)
+MOD_WORDS = re.compile(r"[\s._-]*\b(?:vi[ệe]t\s*h[oó][aá]|vietnamese|vietsub|patch|mod)\b[\s._-]*$", re.IGNORECASE)
 
 
 def parse_dotenv(path):
@@ -442,10 +450,9 @@ def system_env():
     return env
 
 
-def game_folder(name):
+def safe_name(name):
     cleaned = re.sub(r'[:/\\?*"<>|\x00-\x1f]+', " ", name)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")[:120]
-    return f"[{MOD_TAG}] - {cleaned}"
+    return re.sub(r"\s+", " ", cleaned).strip(" .")[:120]
 
 
 def art_slug(name):
@@ -476,18 +483,14 @@ def display_version(game_version):
     return match.group(0) if match else MISSING_VERSION
 
 
-def target_path(entry):
-    """Path of the final file, relative to the vault root."""
-    version = display_version(entry["game_version"])
-    return Path(game_folder(entry["name"])) / f"[{version}-{INTERNAL_VERSION}] [{MOD_TAG}].zip"
-
-
 def plan_repack(infos, title_id):
-    """Map source zip members to contents/<title id>/... names, in source order."""
+    """Map source zip members to contents/<title id>/... names, in source order. Every title
+    in the zip stays: a pack's extra titles, such as a system font, belong to the game."""
     if not TITLE_ID.match(title_id):
         raise RuntimeError(f"title id không hợp lệ: {title_id!r}")
     plan = {}
     total = 0
+    found = False
     for info in infos:
         name = info.filename.replace("\\", "/")
         if name.endswith("/"):
@@ -499,19 +502,17 @@ def plan_repack(infos, title_id):
             continue
         index = next((i for i, part in enumerate(parts) if TITLE_ID.match(part)), None)
         if index is None:
-            if parts[-1].lower().endswith(SKIPPED_OUTSIDE):
-                continue
-            raise RuntimeError(f"file nằm ngoài thư mục title id: {name}")
-        if parts[index].lower() != title_id.lower():
-            raise RuntimeError(f"title id lạ trong zip: {parts[index]}")
+            continue
         if index + 1 == len(parts):
             raise RuntimeError(f"cấu trúc lạ trong zip: {name}")
-        arcname = "/".join(["contents", title_id, *parts[index + 1:]])
+        ours = parts[index].lower() == title_id.lower()
+        found = found or ours
+        arcname = "/".join(["contents", title_id if ours else parts[index].upper(), *parts[index + 1:]])
         if arcname.lower() in {key.lower() for key in plan}:
             raise RuntimeError(f"file trùng tên trong zip: {arcname}")
         plan[arcname] = info
         total += info.file_size
-    if not plan:
+    if not found:
         raise RuntimeError(f"không có file nào trong {title_id}")
     if total > MAX_UNPACKED:
         raise RuntimeError("zip giải nén ra quá lớn")
@@ -528,7 +529,24 @@ def member_info(name, date_time, mode, compress_type):
     return info
 
 
-def repack(source, target, title_id, cancel=None):
+def add_member(output, arcname, date_time, size, reader, written, on_bytes=None):
+    """Stream one file into a vault zip, writing its parent folders the first time they appear."""
+    folders = arcname.split("/")[:-1]
+    for depth in range(1, len(folders) + 1):
+        folder = "/".join(folders[:depth]) + "/"
+        if folder not in written:
+            written.add(folder)
+            output.writestr(member_info(folder, date_time, 0o40755, zipfile.ZIP_STORED), b"")
+    info = member_info(arcname, date_time, 0o100644, zipfile.ZIP_DEFLATED)
+    info.file_size = size
+    with output.open(info, "w") as writer:
+        for block in iter(lambda: reader.read(CHUNK), b""):
+            writer.write(block)
+            if on_bytes is not None:
+                on_bytes(len(block))
+
+
+def repack(source, target, title_id, cancel=None, on_bytes=None):
     """Rewrite a mod zip into the vault layout. Members are streamed, never extracted to disk."""
     temp = target.with_name(target.name + ".tmp")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -540,16 +558,8 @@ def repack(source, target, title_id, cancel=None):
             for arcname, member in plan.items():
                 if cancel is not None and cancel.is_set():
                     raise Cancelled
-                folders = arcname.split("/")[:-1]
-                for depth in range(1, len(folders) + 1):
-                    folder = "/".join(folders[:depth]) + "/"
-                    if folder not in written:
-                        written.add(folder)
-                        output.writestr(member_info(folder, member.date_time, 0o40755, zipfile.ZIP_STORED), b"")
-                info = member_info(arcname, member.date_time, 0o100644, zipfile.ZIP_DEFLATED)
-                info.file_size = member.file_size
-                with original.open(member) as reader, output.open(info, "w") as writer:
-                    shutil.copyfileobj(reader, writer, CHUNK)
+                with original.open(member) as reader:
+                    add_member(output, arcname, member.date_time, member.file_size, reader, written, on_bytes)
             expected = {name: member.CRC for name, member in plan.items()}
         with zipfile.ZipFile(temp) as result:
             actual = {i.filename: i.CRC for i in result.infolist() if not i.is_dir()}
@@ -560,12 +570,257 @@ def repack(source, target, title_id, cancel=None):
         temp.unlink(missing_ok=True)
 
 
+def folder_files(folder, prefix=""):
+    """Files of a loose title ID folder, as (path, name inside the folder, under prefix)."""
+    files = []
+    for path in sorted(folder.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError(f"có liên kết tượng trưng: {path.name}")
+        if path.is_file() and path.name.lower() not in JUNK_NAMES:
+            files.append((path, (Path(prefix) / path.relative_to(folder)).as_posix()))
+    if not files:
+        raise RuntimeError("thư mục không có file nào")
+    return files
+
+
+def zip_date(path):
+    """A zip cannot store dates outside 1980-2107."""
+    stamp = time.localtime(path.stat().st_mtime)[:6]
+    return min(max(stamp, (1980, 1, 1, 0, 0, 0)), (2107, 12, 31, 23, 59, 58))
+
+
+def repack_folder(folders, target, cancel=None, on_bytes=None):
+    """Pack loose title ID folders into the same layout as repack."""
+    temp = target.with_name(target.name + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        expected = {}
+        written = set()
+        with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as output:
+            for path, relative in (pair for folder in folders for pair in folder_files(folder, folder.name.upper())):
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled
+                arcname = f"contents/{relative}"
+                size = path.stat().st_size
+                with open(path, "rb") as reader:
+                    add_member(output, arcname, zip_date(path), size, reader, written, on_bytes)
+                expected[arcname] = size
+        with zipfile.ZipFile(temp) as result:
+            actual = {i.filename: i.file_size for i in result.infolist() if not i.is_dir()}
+            if actual != expected or result.testzip() is not None:
+                raise RuntimeError("zip đóng gói không khớp với thư mục gốc")
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def find_mods(root):
+    """Every mod under root, whatever the structure around it, as (kind, paths): one zip, or
+    the title ID folders that sit side by side. atmosphere/ and contents/ are only wrappers,
+    so walking down to the title IDs covers them. Side by side means one pack, except in
+    root itself, which holds whatever the user gathered there."""
+    found = []
+    for folder, dirs, files in os.walk(root):
+        dirs.sort()
+        titles = [Path(folder) / name for name in dirs if TITLE_ID.match(name)]
+        if titles:
+            found.extend(("folder", [title]) for title in titles) if Path(folder) == root \
+                else found.append(("folder", titles))
+        dirs[:] = [name for name in dirs if not TITLE_ID.match(name) and name != "__MACOSX"]
+        found.extend(("zip", [Path(folder) / name]) for name in sorted(files) if name.lower().endswith(".zip"))
+    return found
+
+
+def zip_titles(infos):
+    """Title IDs found in a zip, each once, in upper case."""
+    titles = []
+    for info in infos:
+        parts = info.filename.replace("\\", "/").split("/")
+        if parts[0] != "__MACOSX":
+            title = next((part.upper() for part in parts[:-1] if TITLE_ID.match(part)), None)
+            if title and title not in titles:
+                titles.append(title)
+    return titles
+
+
+def clean_mod_name(text):
+    """The game name inside a file or folder name, or "" when there is none."""
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}", " ", unicodedata.normalize("NFC", text))
+    text = VERSION_IN_NAME.sub(" ", text).replace("_", " ")
+    text = re.sub(r"\s+", " ", MOD_WORDS.sub("", text)).strip(" .-")
+    return "" if text.lower() in WRAPPER_NAMES or TITLE_ID.match(text) else text
+
+
+def guess_details(kind, path, root):
+    """Name and version from the file name and the folders around it, nearest first."""
+    relative = path.relative_to(root)
+    names = ([relative.stem] if kind == "zip" else []) + [parent.name for parent in relative.parents if parent.name]
+    name = next(filter(None, map(clean_mod_name, names)), "")
+    versions = (VERSION_IN_NAME.search(candidate) for candidate in names)
+    version = next((match.group(0) for match in versions if match), "")
+    return name, version
+
+
+def parse_titles(data):
+    """Reduce a titledb file, keyed by eShop id, to {title ID: game name}."""
+    names = {}
+    for row in data.values() if isinstance(data, dict) else ():
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and isinstance(row.get("name"), str):
+            if TITLE_ID.match(row["id"]) and row["name"].strip():
+                names.setdefault(row["id"].upper(), row["name"].strip())
+    return names
+
+
+def title_name(names, title):
+    """The game's name. Update title IDs end in 800, and share the base game's ID otherwise."""
+    name = names.get(title) or names.get(title[:-3] + "000") or ""
+    return re.sub(r"[™®©]", "", name)
+
+
+def tidy_capitals(name):
+    """Turn an all-capitals name into Title Case, word by word. Roman numerals and title IDs stay."""
+    def tidy(word):
+        text = word.group(0)
+        if TITLE_ID.match(text):
+            return text
+        return re.sub(r"[^\W\d_]+", lambda part: part.group(0) if ROMAN_NUMERAL.fullmatch(part.group(0))
+                      else part.group(0).capitalize(), text)
+
+    return re.sub(r"[^\s-]+", tidy, name) if name.isupper() else name
+
+
+def clean_game_name(name):
+    """A game name for a folder: letters of any language, digits, spaces and hyphens only.
+    Slashes separate words, so they become spaces; other symbols simply go. All-capitals
+    names are tidied too."""
+    text = re.sub(r"[/\\|]+", " ", unicodedata.normalize("NFC", name))
+    text = "".join(char for char in text if char in " -" or char.isspace() or unicodedata.category(char)[0] in "LNM")
+    text = re.sub(r"\s+", " ", text).strip(" -")[:120]
+    return tidy_capitals(text) or safe_name(name)
+
+
+def game_folder(name, mod):
+    return f"{clean_game_name(name)} - [{mod}]"
+
+
+def normalized_path(name, version, mod):
+    """Path of a normalized mod, relative to the folder it is saved in."""
+    return Path(game_folder(name, mod)) / f"[{display_version(version)}-{INTERNAL_VERSION}] [{mod}].zip"
+
+
+def is_game_title(title):
+    """Below this are the console's own titles, such as system fonts."""
+    return int(title, 16) >= FIRST_GAME_TITLE
+
+
+def main_title(titles, names, known):
+    """The title that names a pack: one known to be a game, else any that looks like a game."""
+    games = [title for title in titles if is_game_title(title)]
+    return next((title for title in games if title_name(names, title) or title in known), None) \
+        or next(iter(games), None) or titles[0]
+
+
+def title_plan(kind, paths, titles, scan, message=None, size=0):
+    """One output zip. The name comes from the title database, then a catalog listing the
+    title, then the file name; "guessed" marks a name that may change to avoid a clash."""
+    title = main_title(titles, scan["names"], scan["known"]) if titles else ""
+    guess_name, guess_version = guess_details(kind, paths[0], scan["root"])
+    entry = scan["known"].get(title)
+    official = title_name(scan["names"], title) or (entry and entry["name"])
+    name = official or guess_name or title
+    version = (entry and entry["game_version"]) or guess_version
+    source = paths[0] if len(paths) == 1 else paths[0].parent
+    return {"kind": kind, "source": source, "paths": paths, "title_id": title, "extra_titles": len(titles) - 1,
+            "name": name, "version": version,
+            "guessed": not official, "target": scan["dest"] / normalized_path(name, version, scan["mod"]),
+            "status": "error" if message else "ready", "message": message or "", "size": size, "written": 0}
+
+
+def separate_clashes(plans, scan):
+    """Titles with guessed names can land on one path, such as two titles in one pack. Keep
+    them apart with the title ID. The same title twice is a real duplicate and stays one."""
+    groups = {}
+    for plan in plans:
+        groups.setdefault(str(plan["target"]).casefold(), []).append(plan)
+    for group in groups.values():
+        if len({plan["title_id"] for plan in group}) > 1:
+            for plan in group:
+                if plan["guessed"]:
+                    plan["name"] = f"{plan['name']} {plan['title_id']}"
+                    plan["target"] = scan["dest"] / normalized_path(plan["name"], plan["version"], scan["mod"])
+
+
+def mark_conflicts(plans):
+    """Normalizing never overwrites: a file that is already there keeps its source in place."""
+    seen = set()
+    for plan in plans:
+        if plan["status"] != "ready":
+            continue
+        key = str(plan["target"]).casefold()
+        if plan["target"].exists():
+            plan["status"], plan["message"] = "conflict", "Đã có file này ở thư mục lưu"
+        elif key in seen:
+            plan["status"], plan["message"] = "conflict", "Trùng với một mod khác trong lần quét này"
+        seen.add(key)
+
+
+def plan_mods(root, dest, known, names, mod):
+    """Decide what normalizing would do. Nothing on disk changes here."""
+    scan = {"root": root, "dest": dest, "known": known, "names": names, "mod": mod}
+    plans = []
+    for kind, paths in find_mods(root):
+        if kind == "folder":
+            titles = [path.name.upper() for path in paths]
+            try:
+                size = sum(file.stat().st_size for path in paths for file, _ in folder_files(path))
+                plans.append(title_plan(kind, paths, titles, scan, size=size))
+            except (OSError, RuntimeError) as error:
+                plans.append(title_plan(kind, paths, titles, scan, str(error)))
+            continue
+        try:
+            with zipfile.ZipFile(paths[0]) as archive:
+                infos = archive.infolist()
+        except (OSError, zipfile.BadZipFile) as error:
+            plans.append(title_plan(kind, paths, [], scan, f"không đọc được zip: {error}"))
+            continue
+        titles = zip_titles(infos)
+        if not titles:
+            plans.append(title_plan(kind, paths, [], scan, "không tìm thấy thư mục Title ID"))
+            continue
+        plan = title_plan(kind, paths, titles, scan)
+        try:
+            plan["size"] = sum(info.file_size for info in plan_repack(infos, plan["title_id"]).values())
+        except RuntimeError as error:
+            plan.update(status="error", message=str(error))
+        plans.append(plan)
+    separate_clashes(plans, scan)
+    mark_conflicts(plans)
+    return plans
+
+
+def remove_source(path, root):
+    """Delete a processed source, then any wrapper folders it leaves empty, up to root."""
+    remove_path(path)
+    for parent in path.parents:
+        if parent == root or root not in parent.parents:
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
 def sha256_of(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def log_line(text, level):
+    """A log entry: level is info, ok, warn or error, and sets its color."""
+    return level, f"{datetime.now():%H:%M:%S}  {text}"
 
 
 class Cancelled(Exception):
@@ -583,12 +838,21 @@ class Vault:
         self.jobs = {}
         self.cancels = {}
         self.queue = queue.Queue()
+        self.download_log = []
         self.checked_at = None
         self.check_error = None
         self.checking = False
         self.app_update = None
         self.app_update_job = None
+        self.normalize_job = {"phase": "idle", "plans": [], "done": 0, "total": 0, "message": "", "failed": False,
+                              "bytes_done": 0, "bytes_total": 0, "log": []}
+        self.normalize_cancel = threading.Event()
         registry = self._load_json(self.registry_path, {})
+        titles = self._load_json(self.catalogs_dir / TITLES_FILE, {})
+        self.titles = titles if isinstance(titles, dict) else {}
+        self.mod_name = safe_name(str(registry.get("mod_name") or ""))
+        self.download_dir = str(registry.get("download_dir") or "")
+        self.normalize_dest = str(registry.get("normalize_dest") or "")
         self.catalogs = registry.get("catalogs", [])
         active = next((c for c in self.catalogs if c["folder"] == registry.get("active")), None)
         self._use_catalog(active or (self.catalogs[0] if self.catalogs else None))
@@ -597,7 +861,7 @@ class Vault:
         """Point the vault at one catalog. Every catalog has its own files and state."""
         self.catalog = catalog
         folder = catalog["folder"] if catalog else "_none"
-        self.root = self.base / DOWNLOAD_DIR / folder
+        self.root = self._download_root() / folder
         self.art_dir = self.base / "covers" / folder
         self.art_index = self.catalogs_dir / f"{folder}.covers.json"
         self.state_path = self.catalogs_dir / f"{folder}.state.json"
@@ -608,13 +872,62 @@ class Vault:
         self.check_error = None
         try:
             mapping = clean_mapping(catalog.get("mapping")) if catalog else None
-            self.items = parse_catalog(json.loads(self.cache_path.read_bytes()), mapping)
+            self.items = self._named(parse_catalog(json.loads(self.cache_path.read_bytes()), mapping))
         except (OSError, ValueError):
             pass
 
+    def _named(self, items):
+        """Show the title database's name for each game, keeping the catalog's as a fallback."""
+        named = []
+        for item in items:
+            catalog_name = item.get("catalog_name", item["name"])
+            name = title_name(self.titles, item["title_id"].upper()) or catalog_name
+            named.append(dict(item, name=name, catalog_name=catalog_name))
+        return named
+
     def _save_registry(self):
         active = self.catalog["folder"] if self.catalog else None
-        self._write_json(self.registry_path, {"active": active, "catalogs": self.catalogs})
+        self._write_json(self.registry_path, {"active": active, "catalogs": self.catalogs,
+                                              "mod_name": self.mod_name, "download_dir": self.download_dir,
+                                              "normalize_dest": self.normalize_dest})
+
+    def _download_root(self):
+        return Path(self.download_dir).expanduser().resolve() if self.download_dir else self.base / DOWNLOAD_DIR
+
+    def set_download_dir(self, text):
+        """Choose where downloads go; blank means the default. Workers read self.root, so it
+        stays put while anything is downloading."""
+        text = text.strip()
+        with self.lock:
+            if text == self.download_dir or self.busy():
+                return
+            self.download_dir = text
+            self.root = self._download_root() / self.root.name
+            self._save_registry()
+
+    def set_normalize_dest(self, text):
+        text = text.strip()
+        with self.lock:
+            if text == self.normalize_dest or self.normalizing():
+                return
+            self.normalize_dest = text
+            self._save_registry()
+            self._drop_scan("Thư mục đích đã đổi, hãy bấm Quét lại.")
+
+    def _drop_scan(self, message):
+        if self.normalize_job["plans"]:
+            self._set_normalize(phase="idle", plans=[], done=0, total=0, failed=False, message=message)
+
+    def set_mod_name(self, name):
+        """Save the one mod name used by downloads and normalizing. A reviewed scan shows
+        paths built from the old name, so it has to be redone."""
+        name = safe_name(name)
+        with self.lock:
+            if name == self.mod_name or self.normalizing():
+                return
+            self.mod_name = name
+            self._save_registry()
+            self._drop_scan("Tên mod đã đổi, hãy bấm Quét lại.")
 
     def add_catalog(self, name, url, mapping=None):
         """Add a catalog after confirming that the URL really serves one, then switch to it.
@@ -687,7 +1000,7 @@ class Vault:
                 # The user may have switched catalogs while this one was loading.
                 if self.catalog is catalog:
                     self._write_bytes(self.cache_path, raw)
-                    self.items = items
+                    self.items = self._named(items)
                     self.check_error = None
                     self.checked_at = time.time()
         except (OSError, ValueError, http.client.HTTPException) as error:
@@ -779,11 +1092,35 @@ class Vault:
         path = (self.root / record["file"]).resolve()
         return path if self.root in path.parents else None
 
+    def game_folders(self, entry):
+        """Where a game's zips may be. Saves made before the title database knew the game
+        are under the catalog's name, and older ones kept symbols that names now lose."""
+        names = {entry["name"], entry.get("catalog_name", entry["name"])}
+        folders = {game_folder(name, self.mod_name) for name in names}
+        folders |= {f"{safe_name(name)} - [{self.mod_name}]" for name in names}
+        return [self.root / folder for folder in folders]
+
+    def saved_zips(self, entry):
+        """Zips in the game's folder under the download root. The folder, unlike the file
+        name, stays the same when the catalog moves to a new game version."""
+        zips = []
+        for folder in self.game_folders(entry):
+            try:
+                zips += [path for path in folder.iterdir() if path.suffix.lower() == ".zip" and path.is_file()]
+            except OSError:
+                pass
+        return zips
+
     def status_of(self, entry):
-        record = self.state.get(entry["id"])
-        path = self.local_path(record) if record else None
-        if path is None or not path.is_file():
+        """What is in the download root decides; the record only says which release it is."""
+        zips = self.saved_zips(entry)
+        if not zips:
             return "missing"
+        record = self.state.get(entry["id"])
+        if not record:
+            # Copied in by hand, so its hash is unknown: only the name can say which version it is.
+            prefix = f"[{display_version(entry['game_version'])}-{INTERNAL_VERSION}]"
+            return "ok" if any(path.name.startswith(prefix) for path in zips) else "update"
         # The original file's SHA-256 is the surest way to spot a new release. When the
         # catalog does not carry one, fall back to comparing the version it reports.
         if entry["sha256"] and record.get("sha256"):
@@ -810,6 +1147,7 @@ class Vault:
                 "active": self.catalog["folder"] if self.catalog else None,
                 "app_update": self.app_update,
                 "app_update_job": self.app_update_job,
+                "log": list(self.download_log),
             }
 
     def enqueue(self, ids):
@@ -821,12 +1159,22 @@ class Vault:
                     self.jobs[entry_id] = {"phase": "queued", "done": 0, "total": entry["size"], "speed": 0}
                     self.cancels[entry_id] = threading.Event()
                     self.queue.put(entry)
+                    self._log_game(entry, f"đã thêm vào hàng đợi")
 
     def cancel(self, entry_id):
         with self.lock:
             event = self.cancels.get(entry_id)
         if event:
             event.set()
+
+    def cancel_all(self):
+        """Stop every queued or running download. Partial files stay, so a later start resumes."""
+        with self.lock:
+            events = list(self.cancels.values())
+        for event in events:
+            event.set()
+        if events:
+            self._log_download(f"Dừng tất cả ({len(events)} mod)", "warn")
 
     def busy(self):
         with self.lock:
@@ -835,6 +1183,13 @@ class Vault:
     def snapshot_jobs(self):
         with self.lock:
             return list(self.jobs.values())
+
+    def _log_download(self, text, level="info"):
+        with self.lock:
+            self.download_log.append(log_line(text, level))
+
+    def _log_game(self, entry, text, level="info"):
+        self._log_download(f"{clean_game_name(entry['name'])}: {text}", level)
 
     def _update_job(self, entry_id, **fields):
         with self.lock:
@@ -893,23 +1248,29 @@ class Vault:
                     raise
                 except urllib.error.HTTPError as error:
                     last_error = f"HTTP {error.code}"
+                    self._log_game(entry, f"lỗi tải (lần {attempt + 1}): {last_error}", "warn")
                     if error.code in (403, 404, 410):
                         break
                 except (OSError, ValueError, http.client.HTTPException) as error:
                     last_error = str(error) or type(error).__name__
+                    self._log_game(entry, f"lỗi tải (lần {attempt + 1}): {last_error}", "warn")
                 else:
                     # With no SHA-256 in the catalog there is nothing to verify against, so a
                     # completed download is accepted as-is.
                     if not entry["sha256"]:
+                        self._log_game(entry, f"catalog không có SHA-256, bỏ qua kiểm tra", "warn")
                         return part
                     self._update_job(entry["id"], phase="verifying", speed=0)
+                    self._log_game(entry, f"đang kiểm tra SHA-256")
                     if sha256_of(part) == entry["sha256"]:
                         return part
                     last_error = "SHA-256 không khớp"
+                    self._log_game(entry, f"{last_error}", "error")
                     part.unlink(missing_ok=True)
                     break
                 time.sleep(1 + attempt)
             if url != entry["urls"][-1]:
+                self._log_game(entry, f"chuyển sang nguồn tải khác", "warn")
                 part.unlink(missing_ok=True)
         raise RuntimeError(last_error)
 
@@ -924,35 +1285,235 @@ class Vault:
                 "downloaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             self._write_json(self.state_path, self.state)
-            if old_path and old_path != target:
-                old_path.unlink(missing_ok=True)
-                if old_path.parent != self.root and not any(old_path.parent.iterdir()):
-                    old_path.parent.rmdir()
+            # Only this game's own copy is replaced: a different mod name is a separate
+            # folder that the user may still want.
+            if old_path and old_path != target and old_path.parent in self.game_folders(entry):
+                self._remove_replaced(old_path)
+
+    def _remove_replaced(self, path):
+        """Tidy up after a saved download. The new file is safe by now, and the user may have
+        moved the old one away, so a failure here is not a failed download."""
+        try:
+            path.unlink(missing_ok=True)
+            if path.parent != self.root and not any(path.parent.iterdir()):
+                path.parent.rmdir()
+        except OSError:
+            pass
 
     def worker(self):
         while True:
             entry = self.queue.get()
             entry_id = entry["id"]
             cancel = self.cancels[entry_id]
-            target = self.root / target_path(entry)
+            target = self.root / normalized_path(entry["name"], entry["game_version"], self.mod_name)
             try:
                 if cancel.is_set():
                     raise Cancelled
                 self._update_job(entry_id, phase="downloading")
+                self._log_game(entry, f"bắt đầu tải ({format_size(entry['size'])})" if entry["size"] else "bắt đầu tải")
                 part = self._download(entry, cancel)
                 self._update_job(entry_id, phase="repacking", speed=0)
+                self._log_game(entry, f"đang đóng gói")
                 repack(part, target, entry["title_id"], cancel)
                 part.unlink()
                 self._commit(entry, target)
+                self._log_game(entry, f"đã lưu {target}", "ok")
                 with self.lock:
                     del self.jobs[entry_id]
             except Cancelled:
+                self._log_game(entry, f"đã huỷ", "warn")
                 with self.lock:
                     del self.jobs[entry_id]
             except Exception as error:
+                self._log_game(entry, f"lỗi: {error}", "error")
                 self._update_job(entry_id, phase="error", message=str(error), speed=0)
             with self.lock:
                 self.cancels.pop(entry_id, None)
+
+    def known_titles(self):
+        """Catalog entries by title ID, from every cached catalog, the active one first."""
+        with self.lock:
+            catalogs = sorted(self.catalogs, key=lambda catalog: catalog is not self.catalog)
+        titles = {}
+        for catalog in catalogs:
+            try:
+                raw = (self.catalogs_dir / f"{catalog['folder']}.json").read_bytes()
+                items = parse_catalog(json.loads(raw), clean_mapping(catalog.get("mapping")))
+            except (OSError, ValueError):
+                continue
+            for item in items:
+                if item["title_id"]:
+                    titles.setdefault(item["title_id"].upper(), item)
+        return titles
+
+    def title_names(self):
+        """{title ID: game name}, from a cached database that is refreshed once a week. A
+        failed refresh keeps the old copy, which may be empty on a first run offline."""
+        path = self.catalogs_dir / TITLES_FILE
+        names = self._load_json(path, {})
+        try:
+            if names and time.time() - path.stat().st_mtime < TITLES_MAX_AGE:
+                return names
+        except OSError:
+            pass
+        try:
+            with http_get(TITLES_URL, timeout=60) as response:
+                raw = response.read(MAX_TITLES + 1)
+            if len(raw) > MAX_TITLES:
+                raise ValueError("danh sách tên game quá lớn")
+            fetched = parse_titles(json.loads(raw))
+            if fetched:
+                self._write_json(path, fetched)
+                return fetched
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+        return names
+
+    def refresh_titles(self):
+        names = self.title_names()
+        with self.lock:
+            if names != self.titles:
+                self.titles = names
+                self.items = self._named(self.items)
+        return names
+
+    def normalize_snapshot(self):
+        with self.lock:
+            job = dict(self.normalize_job)
+            job["plans"] = [dict(plan) for plan in job["plans"]]
+            job["log"] = list(job["log"])
+            return job
+
+    def normalizing(self):
+        with self.lock:
+            return self.normalize_job["phase"] in ("scanning", "working")
+
+    def _set_normalize(self, **fields):
+        with self.lock:
+            self.normalize_job.update(fields)
+
+    def _log(self, text, level="info"):
+        with self.lock:
+            self.normalize_job["log"].append(log_line(text, level))
+
+    def scan_mods(self, source, dest):
+        """Fill the normalize job with a plan for the user to review."""
+        self._set_normalize(phase="scanning", plans=[], done=0, total=0, message="", failed=False, log=[])
+        self._log(f"Quét {source.strip()}")
+        try:
+            if not source.strip() or not dest.strip():
+                raise ValueError("Hãy nhập cả hai thư mục")
+            mod = self.mod_name
+            if not mod:
+                raise ValueError("Hãy nhập tên mod")
+            root = Path(source.strip()).expanduser().resolve()
+            target = Path(dest.strip()).expanduser().resolve()
+            if not root.is_dir():
+                raise ValueError(f"Không có thư mục: {root}")
+            # Otherwise the scan would pick up its own results, or delete the folder it saves to.
+            # The source may sit inside the destination: nothing is written into it.
+            if root == target or root in target.parents:
+                raise ValueError("Thư mục đích không được trùng hoặc nằm trong Thư mục nguồn")
+            names = self.refresh_titles()
+            plans = plan_mods(root, target, self.known_titles(), names, mod)
+            ready = sum(plan["status"] == "ready" for plan in plans)
+            message = f"Tìm thấy {len(plans)} mod, {ready} sẵn sàng chuẩn hóa." if plans else "Không tìm thấy mod nào."
+            if plans and not names:
+                message += " Không tải được danh sách tên game nên tên được đoán từ tên file."
+            self._set_normalize(phase="scanned", plans=plans, root=root, message=message)
+            self._log(message, "ok" if ready and names else "warn")
+        except (OSError, ValueError) as error:
+            self._set_normalize(phase="idle", message=str(error) or type(error).__name__, failed=True)
+            self._log(f"Lỗi: {self.normalize_job['message']}", "error")
+
+    def _normalize_one(self, plan, cancel):
+        def advance(count):
+            with self.lock:
+                plan["written"] += count
+                self.normalize_job["bytes_done"] += count
+
+        if plan["target"].exists():
+            raise RuntimeError("Đã có file này ở thư mục đích")
+        if plan["kind"] == "folder":
+            repack_folder(plan["paths"], plan["target"], cancel, on_bytes=advance)
+        else:
+            repack(plan["source"], plan["target"], plan["title_id"], cancel, on_bytes=advance)
+
+    def _finish_plan(self, plan, **fields):
+        """Settle one mod. The overall bar counts the bytes of a failed mod as passed."""
+        with self.lock:
+            self.normalize_job["bytes_done"] += plan["size"] - plan["written"]
+            plan.update(fields, written=plan["size"])
+
+    def _remove_processed(self, path, root, plans):
+        try:
+            if path.exists():
+                remove_source(path, root)
+                self._log(f"Đã xoá {path.relative_to(root)}")
+        except OSError as error:
+            self._log(f"Không xoá được {path.relative_to(root)}: {error}", "error")
+            with self.lock:
+                for plan in plans:
+                    plan["message"] = f"Đã lưu nhưng không xoá được file gốc: {error}"
+
+    def _remove_outer_folders(self, plans, root):
+        """Delete each top-level folder of the source, whatever else it holds, but only when
+        every mod found in it was saved: anything failed or skipped must keep its files."""
+        outer = {}
+        for plan in plans:
+            parts = plan["paths"][0].relative_to(root).parts
+            if len(parts) > 1:
+                outer.setdefault(root / parts[0], []).append(plan)
+        for folder, group in outer.items():
+            if all(plan["status"] == "done" for plan in group):
+                self._remove_processed(folder, root, group)
+
+    def normalize_mods(self):
+        """Run the reviewed plan. A source is deleted only once its zip is saved."""
+        with self.lock:
+            job = self.normalize_job
+            plans, root = job["plans"], job.get("root")
+            ready = [plan for plan in plans if plan["status"] == "ready"]
+            job.update(phase="working", done=0, total=len(ready), message="", bytes_done=0,
+                       bytes_total=sum(plan["size"] for plan in ready))
+        cancel = self.normalize_cancel
+        cancel.clear()
+        self._log(f"Bắt đầu chuẩn hóa {len(ready)} mod")
+        for plan in plans:
+            if plan["status"] in ("conflict", "error"):
+                self._log(f"Bỏ qua {clean_game_name(plan['name'])}: {plan['message']}",
+                          "error" if plan["status"] == "error" else "warn")
+        cancelled = False
+        for plan in ready:
+            try:
+                if cancel.is_set():
+                    raise Cancelled
+                with self.lock:
+                    plan["status"] = "working"
+                self._log(f"Đang đóng gói {clean_game_name(plan['name'])} ({format_size(plan['size'])})")
+                self._normalize_one(plan, cancel)
+                self._finish_plan(plan, status="done")
+                with self.lock:
+                    job["done"] += 1
+                self._log(f"Đã lưu {plan['target']}", "ok")
+                for path in plan["paths"]:
+                    self._remove_processed(path, root, [plan])
+            except Cancelled:
+                with self.lock:
+                    job["bytes_done"] -= plan["written"]
+                    plan.update(status="ready", written=0)
+                cancelled = True
+                break
+            except Exception as error:
+                self._finish_plan(plan, status="error", message=str(error) or type(error).__name__)
+                self._log(f"Lỗi {clean_game_name(plan['name'])}: {plan['message']}", "error")
+        self._remove_outer_folders(plans, root)
+        failed = sum(plan["status"] == "error" for plan in ready)
+        message = f"Đã chuẩn hóa {job['done']}/{len(ready)} mod."
+        message += f" {failed} mod lỗi." if failed else ""
+        message = "Đã huỷ. " + message if cancelled else message
+        self._set_normalize(phase="scanned", message=message)
+        self._log(message, "error" if failed else "warn" if cancelled else "ok")
 
     def clear_error(self, entry_id):
         with self.lock:
@@ -1002,6 +1563,52 @@ LIST_COLUMNS = (("game", "Game", 0), ("tags", "Thể loại", 250), ("version", 
 ROW_COLORS = {"update": "accent", "active": "accent", "ok": "ok", "error": "bad", "missing": "ink"}
 
 
+def popup(title, message, parent, buttons):
+    """A modal dialog with centered text. Native message boxes cannot center it. Returns the
+    index of the chosen button; closing the window counts as the last one."""
+    window = tk.Toplevel(parent, bg=COLORS["bg"])
+    window.withdraw()
+    window.title(title)
+    window.resizable(False, False)
+    window.transient(parent.winfo_toplevel())
+    chosen = [len(buttons) - 1]
+
+    def choose(index):
+        chosen[0] = index
+        window.destroy()
+
+    frame = ttk.Frame(window, padding=(28, 22, 28, 18))
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text=message, justify="center", anchor="center", wraplength=460).pack(fill="x", pady=(0, 18))
+    row = ttk.Frame(frame)
+    row.pack()
+    for index, label in enumerate(buttons):
+        ttk.Button(row, text=label, width=10, style="TButton" if index else "Accent.TButton",
+                   command=lambda value=index: choose(value)).pack(side="left", padx=4)
+    window.bind("<Return>", lambda _: choose(0))
+    window.bind("<Escape>", lambda _: choose(len(buttons) - 1))
+    window.protocol("WM_DELETE_WINDOW", lambda: choose(len(buttons) - 1))
+    parent.update_idletasks()
+    window.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - window.winfo_reqwidth()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - window.winfo_reqheight()) // 2
+    window.geometry(f"+{max(0, x)}+{max(0, y)}")
+    window.deiconify()
+    window.wait_visibility()
+    window.grab_set()
+    window.focus_set()
+    window.wait_window()
+    return chosen[0]
+
+
+def show_message(title, message, parent):
+    popup(title, message, parent, ("OK",))
+
+
+def ask_yes_no(title, message, parent):
+    return popup(title, message, parent, ("Có", "Không")) == 0
+
+
 class GameRow:
     """One list row. A Treeview cannot draw tag chips or rows of different heights."""
 
@@ -1038,6 +1645,8 @@ class GameRow:
 
     def bind(self, widget):
         widget.bind("<Button-1>", lambda _: self.app.select(self.id))
+        widget.bind("<Control-Button-1>", lambda _: self.app.toggle_pick(self.id))
+        widget.bind("<Shift-Button-1>", lambda _: self.app.pick_range(self.id))
         widget.bind("<Double-1>", lambda _: self.app.act())
         widget.bind("<Button-4>", lambda _: self.app.scroll_list(-1))
         widget.bind("<Button-5>", lambda _: self.app.scroll_list(1))
@@ -1052,7 +1661,7 @@ class GameRow:
     def paint(self, item, selected):
         version = display_version(item["game_version"])
         missing = version == MISSING_VERSION
-        values = (item["name"], item["version"] or "-", "Miss" if missing else version,
+        values = (clean_game_name(item["name"]), item["version"] or "-", "Miss" if missing else version,
                   format_size(item["size"]), status_text(item), row_tag(item))
         if values != self.values:
             self.values = values
@@ -1082,12 +1691,16 @@ class App:
         self.root.title(f"PatchVault {app_version()}")
         self.root.geometry("1640x900")
         self.root.minsize(1320, 620)
+        self._maximize()
         self.root.configure(bg=COLORS["bg"])
         self.items = {}
         self.shown_ids = []
         self.rows = {}
         self.row_signature = None
         self.selected = None
+        self.picked = set()
+        self.pick_anchor = None
+        self.chosen = []
         self.game_width = 300
         self.detail_id = None
         self.detail_key = None
@@ -1099,7 +1712,6 @@ class App:
         self.selected_genres = set()
         self.genre_panel = None
         self.genre_panel_anchor = None
-        self.app_check_result = None
         self.prompted_tag = None
         self.catalog_folders = []
         self.manager = None
@@ -1107,6 +1719,12 @@ class App:
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+
+    def _maximize(self):
+        try:
+            self.root.state("zoomed")  # Windows and macOS
+        except tk.TclError:
+            self.root.attributes("-zoomed", True)  # X11
 
     def _style(self):
         style = ttk.Style(self.root)
@@ -1142,6 +1760,17 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectForeground", c["ink"])
         style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"], borderwidth=0)
         style.configure("Vertical.TScrollbar", background=c["panel"], arrowcolor=c["muted"])
+        style.configure("TNotebook", background=c["bg"], borderwidth=0, tabmargins=0)
+        style.configure("TNotebook.Tab", background=c["bg"], foreground=c["muted"], padding=(14, 6), borderwidth=0)
+        # clam enlarges the selected tab through these two options; keep every tab the same size.
+        style.map("TNotebook.Tab", background=[("selected", c["accent"]), ("active", c["line"])],
+                  foreground=[("selected", c["accent_ink"])], padding=[("selected", (14, 6))],
+                  expand=[("selected", (0, 0, 0, 0))])
+        style.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["ink"],
+                        rowheight=26, borderwidth=0)
+        style.map("Treeview", background=[("selected", c["select"])], foreground=[("selected", c["ink"])])
+        style.configure("Treeview.Heading", background=c["panel"], foreground=c["muted"], relief="flat", padding=6)
+        style.map("Treeview.Heading", background=[("active", c["line"])])
 
     def _build(self):
         header = ttk.Frame(self.root, padding=(14, 12, 14, 6))
@@ -1149,16 +1778,39 @@ class App:
         ttk.Label(header, text="PatchVault", style="Title.TLabel").pack(side="left")
         self.summary = ttk.Label(header, style="Muted.TLabel")
         self.summary.pack(side="left", padx=14)
-        top = ttk.Frame(self.root, padding=(14, 0, 14, 8))
+        self.mod_name = tk.StringVar(value=self.vault.mod_name)
+        self.mod_entry = ttk.Entry(header, textvariable=self.mod_name, width=24)
+        self.mod_entry.pack(side="right")
+        ttk.Label(header, text="Tên mod", style="Muted.TLabel").pack(side="right", padx=(0, 6))
+        self.mod_name.trace_add("write", lambda *_: self.vault.set_mod_name(self.mod_name.get()))
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(fill="both", expand=True, padx=14)
+        library = ttk.Frame(self.tabs)
+        self.tabs.add(library, text="Tải mod")
+        normalizer = ttk.Frame(self.tabs, padding=(0, 12, 0, 0))
+        self.tabs.add(normalizer, text="Chuẩn hóa mod")
+        self.normalizer = NormalizeTab(self, normalizer)
+        top = ttk.Frame(library, padding=(0, 10, 0, 6))
         top.pack(fill="x")
+        target = ttk.Frame(library, padding=(0, 0, 0, 8))
+        target.pack(fill="x")
+        ttk.Label(target, text="Thư mục đích", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        self.library_views = ViewSwitch(target, self.show_library_view)
+        self.download_button = ttk.Button(target, text="Chọn…", command=self.browse_download)
+        self.download_button.pack(side="right", padx=(6, 0))
+        self.download_dir = tk.StringVar(value=self.vault.download_dir)
+        self.download_entry = ttk.Entry(target, textvariable=self.download_dir)
+        self.download_entry.pack(side="left", fill="x", expand=True)
+        self.download_dir.trace_add("write", lambda *_: self.vault.set_download_dir(self.download_dir.get()))
         self.open_button = ttk.Button(top, text="Mở thư mục", command=self.open_folder)
         self.open_button.pack(side="right", padx=(6, 0))
         self.check_button = ttk.Button(top, text="Cập nhật catalog", command=self.check)
         self.check_button.pack(side="right", padx=(6, 0))
-        self.app_update_button = ttk.Button(top, style="Accent.TButton", command=self.start_app_update)
         self.get_all_button = ttk.Button(top, command=self.get_all)
         self.get_all_button.pack(side="right", padx=(6, 0))
         self.update_all_button = ttk.Button(top, style="Accent.TButton", command=self.update_all)
+        self.chosen_button = ttk.Button(top, style="Accent.TButton", command=self.get_chosen)
+        self.stop_button = ttk.Button(top, text="Dừng tất cả", command=self.vault.cancel_all)
         self.search = tk.StringVar()
         self.search.trace_add("write", lambda *_: self.rebuild_rows())
         ttk.Label(top, text="Catalog", style="Muted.TLabel").pack(side="left", padx=(0, 6))
@@ -1175,8 +1827,9 @@ class App:
         self.root.bind("<Button-1>", self.close_genre_panel_on_click, add="+")
         self.root.bind("<Configure>", self.close_genre_panel_on_move, add="+")
 
-        body = ttk.Frame(self.root, padding=(14, 0, 14, 0))
-        body.pack(fill="both", expand=True)
+        body = self.library_body = ttk.Frame(library)
+        self.download_log = LogPane(self, library)
+        self.library_views.show("list")
         table = tk.Frame(body, bg=COLORS["field"])
         table.pack(side="left", fill="both", expand=True)
         self.list_header = tk.Frame(table, bg=COLORS["panel"])
@@ -1202,7 +1855,9 @@ class App:
         self.list_canvas.bind("<MouseWheel>", lambda event: self.scroll_list(-1 if event.delta > 0 else 1))
         self.list_canvas.bind("<Up>", lambda _: self.move_selection(-1))
         self.list_canvas.bind("<Down>", lambda _: self.move_selection(1))
-        self.list_canvas.bind("<Return>", lambda _: self.act())
+        self.list_canvas.bind("<Return>", lambda _: self.get_chosen() if len(self.picked) > 1 else self.act())
+        self.root.bind("<Control-a>", self.pick_all)
+        self.root.bind("<Control-A>", self.pick_all)
 
         detail = ttk.Frame(body, width=440, padding=(14, 0, 0, 0))
         detail.pack(side="left", fill="y")
@@ -1232,8 +1887,13 @@ class App:
         self.footer = ttk.Label(foot, style="Muted.TLabel")
         self.footer.pack(side="left")
         ttk.Label(foot, text=app_version(), style="Muted.TLabel").pack(side="right")
-        self.app_check_button = ttk.Button(foot, text="Kiểm tra cập nhật app", command=self.check_app)
-        self.app_check_button.pack(side="right", padx=(0, 10))
+        self.app_update_button = ttk.Button(foot, style="Accent.TButton", command=self.start_app_update)
+
+    def show_library_view(self, view):
+        shown, hidden = (self.download_log.frame, self.library_body) if view == "log" \
+            else (self.library_body, self.download_log.frame)
+        hidden.pack_forget()
+        shown.pack(fill="both", expand=True)
 
     def _text_tags(self):
         c = COLORS
@@ -1316,7 +1976,8 @@ class App:
 
     def matches(self, item):
         query = self.search.get().strip().lower()
-        haystack = " ".join([item["name"], item["developer"], item["translator"], *item["tags"]]).lower()
+        haystack = " ".join([item["name"], clean_game_name(item["name"]), item["developer"], item["translator"],
+                             *item["tags"]]).lower()
         return (not query or query in haystack) and \
             (not self.selected_genres or not self.selected_genres.isdisjoint(item["tags"]))
 
@@ -1332,10 +1993,54 @@ class App:
             self.list_canvas.yview_scroll(units, "units")
 
     def select(self, entry_id):
+        self.picked = {entry_id}
+        self.pick_anchor = entry_id
+        self.show_picked(entry_id)
+
+    def show_picked(self, entry_id):
         self.selected = entry_id
         self.list_canvas.focus_set()
         self.paint_rows()
         self.show_detail()
+        self.paint_chosen()
+
+    def toggle_pick(self, entry_id):
+        if entry_id in self.picked and len(self.picked) > 1:
+            self.picked.discard(entry_id)
+            entry_id = next(shown for shown in self.shown_ids if shown in self.picked)
+        else:
+            self.picked.add(entry_id)
+        self.pick_anchor = entry_id
+        self.show_picked(entry_id)
+
+    def pick_range(self, entry_id):
+        if self.pick_anchor not in self.shown_ids:
+            self.select(entry_id)
+            return
+        first, last = sorted((self.shown_ids.index(self.pick_anchor), self.shown_ids.index(entry_id)))
+        self.picked = set(self.shown_ids[first:last + 1])
+        self.show_picked(entry_id)
+
+    def pick_all(self, _event):
+        """Ctrl+A for the game list. Typing fields keep their own meaning of the shortcut."""
+        if self.tabs.index("current") == 0 and self.shown_ids \
+                and not isinstance(self.root.focus_get(), (tk.Entry, tk.Text)):
+            self.picked = set(self.shown_ids)
+            self.show_picked(self.selected if self.selected in self.picked else self.shown_ids[0])
+        return "break"
+
+    def paint_chosen(self):
+        """Offer the picked games that can be downloaded, once more than one is picked."""
+        items = (self.items.get(entry_id) for entry_id in self.shown_ids or [] if entry_id in self.picked)
+        self.chosen = [item["id"] for item in items
+                       if item and not item["job"] and item["status"] in ("missing", "update")]
+        if len(self.picked) > 1:
+            self.chosen_button.configure(text=f"Tải đã chọn ({len(self.chosen)})")
+            self.chosen_button.state(["!disabled"] if self.chosen else ["disabled"])
+            if not self.chosen_button.winfo_manager():
+                self.chosen_button.pack(side="right", padx=(6, 0), before=self.get_all_button)
+        else:
+            self.chosen_button.pack_forget()
 
     def move_selection(self, step):
         if self.selected in self.shown_ids:
@@ -1377,12 +2082,14 @@ class App:
                 self.rows[entry_id].frame.pack(fill="x", pady=(0, 1))
             if self.selected not in ids:
                 self.selected = ids[0] if ids else None
+            self.picked = (self.picked & set(ids)) or ({self.selected} if ids else set())
+            self.pick_anchor = self.selected
             self.list_canvas.yview_moveto(0)
         self.paint_rows()
 
     def paint_rows(self):
         for entry_id in self.shown_ids or []:
-            self.rows[entry_id].paint(self.items[entry_id], entry_id == self.selected)
+            self.rows[entry_id].paint(self.items[entry_id], entry_id in self.picked)
 
     def show_detail(self):
         entry_id = self.selected
@@ -1400,7 +2107,7 @@ class App:
             self.action.state(["disabled"])
             return
         self.show_art(item)
-        self.name.configure(text=item["name"])
+        self.name.configure(text=clean_game_name(item["name"]))
         self.paint_action(item)
 
     def fill_text(self, item):
@@ -1487,7 +2194,7 @@ class App:
         self.state_label.configure(text=message)
         self.action.configure(text=label, style="Accent.TButton" if accent else "TButton")
         if active:
-            self.progress["value"] = 1000 * job["done"] / job["total"]
+            self.progress["value"] = 1000 * job["done"] / job["total"] if job["total"] else 0
             if not self.progress.winfo_manager():
                 self.progress.pack(fill="x", pady=(0, 6), before=self.action)
         else:
@@ -1574,7 +2281,12 @@ class App:
         self.preload_art()
         self.show_detail()
         self.paint_header(snapshot)
-        self.paint_app_check()
+        self.download_log.paint(snapshot["log"])
+        self.normalizer.paint(self.vault.normalize_snapshot())
+        self.mod_entry.state(["disabled"] if self.vault.normalizing() else ["!disabled"])
+        downloading = ["disabled"] if self.vault.busy() else ["!disabled"]
+        self.download_entry.state(downloading)
+        self.download_button.state(downloading)
         self.paint_app_update(snapshot["app_update"], snapshot["app_update_job"])
         self.root.after(400, self.refresh)
 
@@ -1594,7 +2306,7 @@ class App:
         if index < 0:
             return
         if self.vault.busy():
-            messagebox.showinfo("Đang tải", "Hãy đợi các file đang tải xong rồi đổi catalog.", parent=self.root)
+            show_message("Đang tải", "Hãy đợi các file đang tải xong rồi đổi catalog.", parent=self.root)
             return
         self.vault.select_catalog(self.catalog_folders[index])
         self.check()
@@ -1625,6 +2337,12 @@ class App:
         size = format_size(sum(item["size"] for item in missing)) if missing else ""
         self.get_all_button.configure(text=f"Tải tất cả ({size})" if size else "Tải tất cả")
         self.get_all_button.state(["!disabled"] if missing else ["disabled"])
+        self.paint_chosen()
+        if self.vault.busy():
+            if not self.stop_button.winfo_manager():
+                self.stop_button.pack(side="right", padx=(6, 0), before=self.get_all_button)
+        else:
+            self.stop_button.pack_forget()
         self.check_button.configure(text="Đang cập nhật…" if snapshot["checking"] else "Cập nhật catalog")
         self.check_button.state(["disabled"] if snapshot["checking"] else ["!disabled"])
         if not self.vault.catalog:
@@ -1634,35 +2352,6 @@ class App:
             self.footer.configure(text="Không cập nhật được catalog: " + snapshot["error"], style="Error.TLabel")
         else:
             self.footer.configure(text="Lưu vào: " + snapshot["dir"], style="Muted.TLabel")
-
-    def check_app(self):
-        self.app_check_button.state(["disabled"])
-        self.app_check_button.configure(text="Đang kiểm tra…")
-        threading.Thread(target=self.run_app_check, daemon=True).start()
-
-    def run_app_check(self):
-        self.app_check_result = self.vault.check_app_update()
-
-    def paint_app_check(self):
-        result = self.app_check_result
-        if result is None:
-            return
-        self.app_check_result = None
-        self.app_check_button.state(["!disabled"])
-        self.app_check_button.configure(text="Kiểm tra cập nhật app")
-        if result == "available":
-            # Asking by hand should prompt again, even after the user declined this version.
-            self.prompted_tag = None
-            return
-        title = "Kiểm tra cập nhật app"
-        if result == "current":
-            message = f"Bạn đang dùng bản mới nhất ({app_version()})."
-        elif result == "unversioned":
-            message = "Bản này không có số phiên bản nên không kiểm tra được."
-        else:
-            self.root.after_idle(messagebox.showerror, title, "Không kiểm tra được bản mới. Hãy thử lại sau.")
-            return
-        self.root.after_idle(messagebox.showinfo, title, message)
 
     def paint_app_update(self, update, job):
         self.app_update = update
@@ -1685,7 +2374,7 @@ class App:
         self.app_update_button.configure(text=label)
         self.app_update_button.state(["disabled"] if phase in ("downloading", "installing") else ["!disabled"])
         if not self.app_update_button.winfo_manager():
-            self.app_update_button.pack(side="left", padx=(8, 0), after=self.genre_button)
+            self.app_update_button.pack(side="right", padx=(0, 10))
         if update["tag"] != self.prompted_tag:
             self.prompted_tag = update["tag"]
             self.root.after_idle(self.prompt_app_update)
@@ -1693,7 +2382,7 @@ class App:
     def prompt_app_update(self):
         action = "Tải về và cập nhật ngay? Ứng dụng sẽ tự khởi động lại." if can_self_update(self.app_update) \
             else "Mở trang tải về để cập nhật?"
-        if messagebox.askyesno("Có phiên bản mới", f"Đã có PatchVault {self.app_update['tag']}. {action}",
+        if ask_yes_no("Có phiên bản mới", f"Đã có PatchVault {self.app_update['tag']}. {action}",
                                parent=self.root):
             self.start_app_update()
 
@@ -1701,16 +2390,26 @@ class App:
         update = self.app_update
         if not can_self_update(update):
             open_in_system(update["url"])
+        elif self.vault.normalizing():
+            show_message("Đang chuẩn hóa", "Hãy đợi chuẩn hóa xong rồi cập nhật ứng dụng.", parent=self.root)
         elif any(job["phase"] != "error" for job in self.vault.snapshot_jobs()):
-            messagebox.showinfo("Đang tải", "Hãy đợi các file đang tải xong rồi cập nhật ứng dụng.", parent=self.root)
+            show_message("Đang tải", "Hãy đợi các file đang tải xong rồi cập nhật ứng dụng.", parent=self.root)
         else:
             self.vault.set_update_job(phase="queued", done=0, total=1)
             threading.Thread(target=self.vault.install_app_update, args=(update,), daemon=True).start()
 
     def report_update_error(self, message):
         text = f"Không cập nhật được: {message}\n\nMở trang tải về để cập nhật thủ công?"
-        if messagebox.askyesno("Lỗi cập nhật", text, icon="warning", parent=self.root):
+        if ask_yes_no("Lỗi cập nhật", text, parent=self.root):
             open_in_system(self.app_update["url"])
+
+    def has_mod_name(self):
+        """Every saved zip carries the mod name, so nothing can start without one."""
+        if self.vault.mod_name:
+            return True
+        show_message("Thiếu tên mod", "Hãy nhập Tên mod ở góc trên bên phải trước khi tải.", parent=self.root)
+        self.mod_entry.focus_set()
+        return False
 
     def act(self):
         item = self.items.get(self.detail_id)
@@ -1719,18 +2418,29 @@ class App:
         job = item["job"]
         if job and job["phase"] != "error":
             self.vault.cancel(item["id"])
-        else:
+        elif self.has_mod_name():
             self.vault.clear_error(item["id"])
             self.vault.enqueue([item["id"]])
 
     def update_all(self):
-        self.vault.enqueue(self.updates)
+        if self.has_mod_name():
+            self.vault.enqueue(self.updates)
+
+    def get_chosen(self):
+        if self.chosen and self.has_mod_name():
+            self.vault.enqueue(self.chosen)
 
     def get_all(self):
-        self.vault.enqueue(self.missing)
+        if self.has_mod_name():
+            self.vault.enqueue(self.missing)
 
     def check(self):
         threading.Thread(target=self.vault.check, daemon=True).start()
+
+    def browse_download(self):
+        folder = filedialog.askdirectory(parent=self.root, initialdir=self.download_dir.get() or None)
+        if folder:
+            self.download_dir.set(folder)
 
     def open_folder(self):
         self.vault.root.mkdir(parents=True, exist_ok=True)
@@ -1740,8 +2450,13 @@ class App:
         active = [job for job in self.vault.snapshot_jobs() if job["phase"] != "error"]
         if self.vault.app_update_job:
             active.append(self.vault.app_update_job)
-        if active and not messagebox.askyesno(
-                "Đang tải", "Vẫn còn file đang tải. Thoát bây giờ? Lần sau có thể tải tiếp từ phần đã tải."):
+        if active and not ask_yes_no(
+                "Đang tải", "Vẫn còn file đang tải. Thoát bây giờ? Lần sau có thể tải tiếp từ phần đã tải.",
+                parent=self.root):
+            return
+        if self.vault.normalizing() and not ask_yes_no(
+                "Đang chuẩn hóa", "Vẫn đang chuẩn hóa mod. Thoát bây giờ? File gốc chưa xử lý xong vẫn được giữ.",
+                parent=self.root):
             return
         self.root.destroy()
 
@@ -1876,10 +2591,200 @@ class CatalogManager:
         if self.vault.busy() and catalog is self.vault.catalog:
             self.status.configure(text="Hãy đợi các file đang tải xong.", style="Error.TLabel")
             return
-        if messagebox.askyesno("Xoá catalog", f"Xoá {catalog['name']} khỏi danh sách? File đã tải vẫn được giữ lại.",
+        if ask_yes_no("Xoá catalog", f"Xoá {catalog['name']} khỏi danh sách? File đã tải vẫn được giữ lại.",
                                parent=self.window):
             self.vault.remove_catalog(catalog["folder"])
             self.fill_list()
+
+
+class LogPane:
+    """Read-only log that only appends what is new and follows the end while scrolled there."""
+
+    FONT_SIZE = 12
+
+    def __init__(self, app, parent):
+        self.frame = ttk.Frame(parent)
+        self.lines = 0
+        self.text = tk.Text(self.frame, wrap="word", bd=0, highlightthickness=0, padx=8, pady=6, spacing1=2,
+                            font=(app.family, self.FONT_SIZE), bg=COLORS["field"], fg=COLORS["ink"], state="disabled",
+                            selectbackground=COLORS["select"], inactiveselectbackground=COLORS["select"])
+        self.text.tag_configure("info", foreground=COLORS["muted"])
+        self.text.tag_configure("ok", foreground=COLORS["ok"])
+        self.text.tag_configure("warn", foreground=COLORS["accent"])
+        self.text.tag_configure("error", foreground=COLORS["bad"], font=(app.family, self.FONT_SIZE, "bold"))
+        scroll = ttk.Scrollbar(self.frame, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+    def paint(self, lines):
+        if len(lines) == self.lines:
+            return
+        self.text.configure(state="normal")
+        if len(lines) < self.lines:
+            self.text.delete("1.0", "end")
+            self.lines = 0
+        following = self.text.yview()[1] >= 1
+        for level, line in lines[self.lines:]:
+            self.text.insert("end", line + "\n", level)
+        self.lines = len(lines)
+        self.text.configure(state="disabled")
+        if following:
+            self.text.see("end")
+
+
+class ViewSwitch:
+    """Danh sách and Log buttons at the right of a toolbar. swap(view) shows that view."""
+
+    def __init__(self, toolbar, swap):
+        self.swap = swap
+        self.log_tab = ttk.Button(toolbar, text="Log", command=lambda: self.show("log"))
+        self.log_tab.pack(side="right")
+        self.list_tab = ttk.Button(toolbar, text="Danh sách", command=lambda: self.show("list"))
+        self.list_tab.pack(side="right", padx=(12, 6))
+
+    def show(self, view):
+        self.swap(view)
+        self.log_tab.configure(style="Accent.TButton" if view == "log" else "TButton")
+        self.list_tab.configure(style="TButton" if view == "log" else "Accent.TButton")
+
+
+class NormalizeTab:
+    """Tab that tidies a folder of mods into the vault layout: scan, review, then move."""
+
+    COLUMNS = (("source", "Nguồn", 340), ("title", "Title ID", 170), ("name", "Tên game", 280),
+               ("version", "Phiên bản game", 120), ("progress", "Tiến độ", 190), ("status", "Trạng thái", 280))
+    STATUS = {"ready": "Sẵn sàng", "working": "Đang đóng gói", "done": "Đã chuẩn hóa", "conflict": "Bỏ qua",
+              "error": "Lỗi"}
+    BAR_CELLS = 14
+
+    def __init__(self, app, parent):
+        self.app = app
+        self.vault = app.vault
+        self.painted = None
+        self.row_keys = []
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(4, weight=1)
+        self.source = tk.StringVar()
+        self.dest = tk.StringVar(value=self.vault.normalize_dest)
+        self.dest.trace_add("write", lambda *_: self.vault.set_normalize_dest(self.dest.get()))
+        for row, (label, variable) in enumerate((("Thư mục nguồn", self.source), ("Thư mục đích", self.dest))):
+            ttk.Label(parent, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+            ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
+            ttk.Button(parent, text="Chọn…", command=lambda v=variable: self.browse(v)).grid(
+                row=row, column=2, padx=(6, 0), pady=3)
+        self.dest_entry = parent.grid_slaves(row=1, column=1)[0]
+        actions = ttk.Frame(parent)
+        actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 8))
+        self.scan_button = ttk.Button(actions, text="Quét", command=self.scan)
+        self.scan_button.pack(side="left")
+        self.run_button = ttk.Button(actions, text="Chuẩn hóa", style="Accent.TButton", command=self.run)
+        self.run_button.pack(side="left", padx=(6, 0))
+        self.cancel_button = ttk.Button(actions, text="Huỷ", command=self.vault.normalize_cancel.set)
+        self.status = ttk.Label(actions, style="Muted.TLabel")
+        self.status.pack(side="left", padx=(12, 0))
+        self.views = ViewSwitch(actions, self.show_view)
+        self.progress = ttk.Progressbar(parent, maximum=1000)
+        table = ttk.Frame(parent)
+        table.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.table = table
+        self.tree = ttk.Treeview(table, columns=[name for name, _, _ in self.COLUMNS], show="headings",
+                                 selectmode="browse")
+        for name, title, width in self.COLUMNS:
+            self.tree.heading(name, text=title, anchor="w")
+            self.tree.column(name, width=width, anchor="w", stretch=name in ("source", "name"))
+        for status, color in (("ready", "ink"), ("working", "accent"), ("done", "ok"), ("conflict", "muted"),
+                              ("error", "bad")):
+            self.tree.tag_configure(status, foreground=COLORS[color])
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.log = LogPane(app, parent)
+        self.views.show("list")
+
+    def show_view(self, view):
+        shown, hidden = (self.log.frame, self.table) if view == "log" else (self.table, self.log.frame)
+        hidden.grid_remove()
+        shown.grid(row=4, column=0, columnspan=3, sticky="nsew")
+
+    def browse(self, variable):
+        folder = filedialog.askdirectory(parent=self.app.root, initialdir=variable.get() or None)
+        if folder:
+            variable.set(folder)
+
+    def scan(self):
+        if not self.vault.normalizing():
+            threading.Thread(target=self.vault.scan_mods, args=(self.source.get(), self.dest.get()),
+                             daemon=True).start()
+
+    def run(self):
+        count = sum(plan["status"] == "ready" for plan in self.vault.normalize_snapshot()["plans"])
+        if count and not self.vault.normalizing() and ask_yes_no(
+                "Chuẩn hóa mod", f"Chuẩn hóa {count} mod? Sau khi lưu xong, file gốc và cả thư mục ngoài cùng chứa nó "
+                f"trong Thư mục nguồn sẽ bị xoá.", parent=self.app.root):
+            threading.Thread(target=self.vault.normalize_mods, daemon=True).start()
+
+    def row(self, plan, root):
+        source = plan["source"]
+        shown = source.relative_to(root).as_posix() if root else source.name
+        status = self.STATUS[plan["status"]]
+        if plan["message"]:
+            status += ": " + plan["message"]
+        version = display_version(plan["version"])
+        title = plan["title_id"] or "-"
+        if plan["extra_titles"] > 0:
+            title += f" +{plan['extra_titles']}"
+        name = clean_game_name(plan["name"])
+        return shown, title, name, "Miss" if version == MISSING_VERSION else version, self.bar(plan), status
+
+    def bar(self, plan):
+        """Text bar for a table row: a Treeview cell cannot hold a real progress bar."""
+        if plan["status"] not in ("ready", "working", "done"):
+            return "-"
+        fraction = 1 if plan["status"] == "done" else min(1, plan["written"] / max(1, plan["size"]))
+        filled = round(fraction * self.BAR_CELLS)
+        return "█" * filled + "░" * (self.BAR_CELLS - filled) + f" {100 * fraction:.0f}%"
+
+    def paint_rows(self, plans, root):
+        keys = [(plan["source"], plan["title_id"]) for plan in plans]
+        if keys != self.row_keys:
+            self.row_keys = keys
+            self.tree.delete(*self.tree.get_children())
+            for index in range(len(plans)):
+                self.tree.insert("", "end", iid=str(index))
+        for index, plan in enumerate(plans):
+            self.tree.item(str(index), values=self.row(plan, root), tags=(plan["status"],))
+            if plan["status"] == "working":
+                self.tree.see(str(index))
+
+    def paint(self, job):
+        plans = job["plans"]
+        key = (job["phase"], job["done"], job["message"], job["bytes_done"], len(job["log"]),
+               *((plan["status"], plan["message"], plan["written"]) for plan in plans))
+        if key == self.painted:
+            return
+        self.painted = key
+        busy = job["phase"] in ("scanning", "working")
+        ready = sum(plan["status"] == "ready" for plan in plans)
+        self.scan_button.state(["disabled"] if busy else ["!disabled"])
+        self.dest_entry.state(["disabled"] if busy else ["!disabled"])
+        self.run_button.state(["!disabled"] if ready and not busy else ["disabled"])
+        self.run_button.configure(text=f"Chuẩn hóa ({ready})" if ready else "Chuẩn hóa")
+        if job["phase"] == "working":
+            fraction = min(1, job["bytes_done"] / max(1, job["bytes_total"]))
+            self.cancel_button.pack(side="left", padx=(6, 0), after=self.run_button)
+            self.progress.configure(value=1000 * fraction)
+            self.progress.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+            text = f"Đang chuẩn hóa {job['done']}/{job['total']} mod · {100 * fraction:.0f}%"
+        else:
+            self.cancel_button.pack_forget()
+            self.progress.grid_remove()
+            text = "Đang quét… Lần đầu cần tải danh sách tên game nên sẽ lâu hơn." if job["phase"] == "scanning" \
+                else job["message"]
+        self.status.configure(text=text, style="Error.TLabel" if job["failed"] else "Muted.TLabel")
+        self.paint_rows(plans, job.get("root"))
+        self.log.paint(job["log"])
 
 
 def compose_banner(cover, background, size):
@@ -1902,6 +2807,7 @@ def periodic_check(vault):
     while True:
         vault.check()
         vault.check_app_update()
+        vault.refresh_titles()
         time.sleep(CHECK_RETRY if vault.check_error else CHECK_INTERVAL)
 
 
@@ -1919,7 +2825,7 @@ def run_check(vault):
     updates = [entry for entry in vault.items if vault.status_of(entry) == "update"]
     missing = sum(vault.status_of(entry) == "missing" for entry in vault.items)
     for entry in updates:
-        old = vault.state[entry["id"]].get("version") or "?"
+        old = vault.state.get(entry["id"], {}).get("version") or "?"
         print(f"Có cập nhật: {entry['name']} ({old} -> {entry['version'] or '?'})")
     print(f"{vault.catalog['name']}: {len(updates)} bản cập nhật, {missing} game chưa tải, "
           f"tổng {len(vault.items)} game.")
@@ -1927,7 +2833,7 @@ def run_check(vault):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tải và theo dõi các bản Việt hoá game Switch.")
+    parser = argparse.ArgumentParser(description="Tải, theo dõi và đóng gói lại mod game.")
     parser.add_argument("--dir", default=str(base_dir()), help="thư mục gốc của dữ liệu, file tải về nằm trong downloaded/")
     parser.add_argument("--check", action="store_true", help="chỉ kiểm tra cập nhật rồi thoát")
     args = parser.parse_args()
