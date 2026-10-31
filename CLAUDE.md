@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make run     # open the app from source (needs Tkinter)
 make check   # print available updates to the terminal, no GUI
 make test    # run the tests
+make lint    # ruff check, ruff format --check and mypy
+make format  # ruff --fix and ruff format
 make build   # build dist/PatchVault-<platform>-<arch>.zip for the current OS
 make clean   # remove dist/, .venv/ and caches (.data/ survives)
 ```
@@ -19,39 +21,52 @@ python3 -B -m unittest tests.test_vault.RepackTests
 python3 -B -m unittest tests.test_vault.RepackTests.<test_method>
 ```
 
-There is no linter or formatter configured. `make build` exits with an error unless
+Settings are in `pyproject.toml`; CI runs the same checks, and a failure blocks a release. `make install`
+also installs the pre-commit hook. `make build` exits with an error unless
 `PATCHVAULT_RELEASES_URL` is set in `.env` or the environment.
 
 ## Architecture
 
-The whole app is one file, `patchvault.py`, which PyInstaller packages directly. It runs on the
-standard library alone: Tkinter and Pillow are imported optionally, and `certifi` is only used
-in packaged builds. Keep source compatible with Python 3.8. `tests/test_vault.py` imports the module
-as `vault` and `scripts/build.py` imports it for its constants, so neither may trigger GUI startup.
+`main.py` is the entry point and the script PyInstaller packages; `python3 -m patchvault` also works.
+The app runs on the standard library alone: Tkinter and Pillow are optional, and `certifi` is only
+used in packaged builds. Keep source compatible with Python 3.8.
 
-The file is layered top to bottom:
+```
+patchvault/
+├── config.py       constants, .env and build config, data folder
+├── net.py          http_get
+├── system.py       per-OS code, replacing the running program
+├── names.py        game name cleaning, versions, normalized_path
+├── catalog.py      parsing untrusted catalogs
+├── zips.py         writing the shared zip layout
+├── normalizer.py   finding mods on disk, planning what to do with them
+├── vault.py        Vault: all state and logic
+├── cli.py          main, the background check loop
+└── ui/             app.py, normalize_tab.py, catalog_manager.py, game_row.py, widgets.py, ...
+```
 
-- **Catalog parsing** (`normalize`, `parse_catalog`, `find_rows`, `FIELD_ALIASES`, `ROOT_ALIASES`).
-  Catalogs are untrusted remote JSON with no fixed schema. Fields are found through aliases or a
+Each module depends only on those listed above it. Only `cli.main` imports `ui`, inside the
+function, so `--check` and the tests work without Tkinter.
+
+`http_get`, `load_config`, `parse_dotenv`, `program_path` and `repack` are called through their
+module (`net.http_get(...)`, `settings.load_config()`) because the tests patch them there.
+`config` is imported as `settings` where a local variable is also called `config`.
+
+- **Catalogs** (`catalog.py`). Catalogs have no fixed schema. Fields are found through aliases or a
   per-catalog user mapping. Only an id and one HTTPS URL are required; SHA-256 and size may be
   absent, and the code degrades rather than fails (`status_of` falls back to version comparison,
   `_download` accepts an unverified file).
-- **Repackaging** (`plan_repack`, `repack`). Rewrites a downloaded zip into the layout described in
-  the README, enforcing limits such as `MAX_UNPACKED`.
-- **`Vault`**. All state and logic, with no Tkinter dependency, which is what the tests exercise.
-- **Normalizing** (`plan_mods`, `Vault.scan_mods`, `Vault.normalize_mods`). Reuses `plan_repack`, `repack` and
-  `normalized_path` for mods already on disk. Planning never touches the disk, so the UI can show a
-  review first. Sources move to `<destination>/backup` only after they are saved, a top-level source folder
-  only after every mod in it is saved, and targets are never overwritten. Game names come from titledb
-  (`Vault.title_names`), cached in `.catalogs/_titles.json`. Downloads and normalizing share
-  `normalized_path` and one mod name, `Vault.mod_name`, which normalizing uses only for sources with
-  no name of their own (`source_mod_name`). It is saved in `.catalogs/index.json`
-  with both destination folders. `status_of` looks for zips in the game's folder under `Vault.root`
-  (the destination, or the default) in both cases and uses the record only to identify the release.
+- **Repackaging** (`zips.py`). `plan_repack` and `repack` rewrite a zip into the layout described in
+  the README, keeping every title ID folder and enforcing limits such as `MAX_UNPACKED`.
+- **Normalizing** (`normalizer.py`, `Vault.scan_mods`, `Vault.normalize_mods`). Planning never
+  touches the disk, so the UI can show a review first. Originals move to `<destination>/backup`
+  only after they are saved, a top-level source folder only after every mod in it is saved, and
+  targets are never overwritten. Game names come from titledb (`Vault.title_names`), cached in
+  `.catalogs/_titles.json`. A source's own `[tag]` is its mod name (`source_mod_name`).
 - **Game names**. `Vault._named` replaces each item's `name` with the titledb name and keeps the
   original as `catalog_name`, so anything using `name` gets the official one.
-- **`App`, `GameRow`, `CatalogManager`, `NormalizeTab`**. The Tkinter UI. Both tabs show their log
-  through `LogPane` and `ViewSwitch`; logs live in `Vault` and last for the session.
+- **UI**. Both tabs show their log through `LogPane` and `ViewSwitch`; logs live in `Vault` and last
+  for the session.
 
 ### Threading
 
@@ -81,7 +96,7 @@ updates are detected after repackaging.
 
 ### Configuration and self-update
 
-`load_config` merges build-time values, then `.env` (source runs only), then the real environment.
+`config.load_config` merges build-time values, then `.env` (source runs only), then the real environment.
 `scripts/build.py` embeds `CONFIG_KEYS` and `PATCHVAULT_VERSION` into a generated
 `patchvault_build_config` module, so a new config key belongs in `CONFIG_KEYS`. Source runs have no
 version, so `check_app_update` returns `"unversioned"` and the self-update path cannot be exercised
@@ -93,6 +108,8 @@ expects exactly 4 assets, so a change to the build matrix must also change `EXPE
 
 ## Conventions
 
+- No docstrings anywhere, on files, classes or functions, including in new files. Use a short `#`
+  comment for code that is complex or needs a reason.
 - User-facing strings, including error messages and CLI help, are in Vietnamese. Identifiers,
   comments and docs are in English.
 - Commit messages must follow Conventional Commits: pushing to `main` runs semantic-release, so

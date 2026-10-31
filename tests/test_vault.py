@@ -1,9 +1,12 @@
 import hashlib
 import io
 import json
+import os
 import random
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 import zlib
@@ -13,13 +16,21 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.dont_write_bytecode = True
 
-import patchvault as vault  # noqa: E402
+from patchvault import catalog, names, net, normalizer, system, vault, zips
+from patchvault import config as settings
 
 TITLE = "0100BA4026E94000"
 
+
 def entry(**overrides):
-    fields = {"id": "game", "sha256": "0" * 64, "size": 1, "url": "https://example.com/a.zip",
-              "name": "Game", "title_id": TITLE}
+    fields = {
+        "id": "game",
+        "sha256": "0" * 64,
+        "size": 1,
+        "url": "https://example.com/a.zip",
+        "name": "Game",
+        "title_id": TITLE,
+    }
     return {**fields, **overrides}
 
 
@@ -28,12 +39,13 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / ".env"
             path.write_text('# comment\n\nA=1\nB = "two=2"\nC=\n', encoding="utf-8")
-            self.assertEqual(vault.parse_dotenv(path), {"A": "1", "B": "two=2", "C": ""})
+            self.assertEqual(settings.parse_dotenv(path), {"A": "1", "B": "two=2", "C": ""})
 
     def test_environment_overrides_dotenv(self):
-        with mock.patch.object(vault, "parse_dotenv", return_value={"PATCHVAULT_RELEASES_URL": "file"}), \
-                mock.patch.dict(vault.os.environ, {"PATCHVAULT_RELEASES_URL": "env", "OTHER": "x"}):
-            config = vault.load_config()
+        with mock.patch.object(
+            settings, "parse_dotenv", return_value={"PATCHVAULT_RELEASES_URL": "file"}
+        ), mock.patch.dict(os.environ, {"PATCHVAULT_RELEASES_URL": "env", "OTHER": "x"}):
+            config = settings.load_config()
         self.assertEqual(config["PATCHVAULT_RELEASES_URL"], "env")
         self.assertNotIn("OTHER", config)
 
@@ -49,7 +61,7 @@ class CatalogManagementTests(unittest.TestCase):
         raw = json.dumps({"mods": [entry(id=game, name=game.title()) for game in games]}).encode()
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = raw
-        return mock.patch.object(vault, "http_get", return_value=response)
+        return mock.patch.object(net, "http_get", return_value=response)
 
     def add(self, name, url, games=("one",)):
         with self.served(games):
@@ -77,7 +89,7 @@ class CatalogManagementTests(unittest.TestCase):
         for body in (b"not json", b"[]", b'{"mods": []}'):
             response = mock.MagicMock()
             response.__enter__.return_value.read.return_value = body
-            with mock.patch.object(vault, "http_get", return_value=response), self.assertRaises(ValueError):
+            with mock.patch.object(net, "http_get", return_value=response), self.assertRaises(ValueError):
                 self.store.add_catalog("x", "https://a.test/c.json")
         self.assertEqual(self.store.catalogs, [])
 
@@ -89,7 +101,7 @@ class CatalogManagementTests(unittest.TestCase):
         self.store.set_mod_name("VI")
         first = self.add("A", "https://a.test/c.json", ("one",))
         item = self.store.items[0]
-        target = self.store.root / vault.normalized_path(item["name"], item["game_version"], "VI")
+        target = self.store.root / names.normalized_path(item["name"], item["game_version"], "VI")
         target.parent.mkdir(parents=True)
         target.write_bytes(b"zip")
         self.store._commit(item, target)
@@ -128,7 +140,7 @@ class CatalogManagementTests(unittest.TestCase):
 
     def test_check_failure_keeps_the_old_list(self):
         self.add("A", "https://a.test/c.json")
-        with mock.patch.object(vault, "http_get", side_effect=OSError("offline")):
+        with mock.patch.object(net, "http_get", side_effect=OSError("offline")):
             self.store.check()
         self.assertEqual(len(self.store.items), 1)
         self.assertEqual(self.store.check_error, "offline")
@@ -143,50 +155,52 @@ class CatalogManagementTests(unittest.TestCase):
             return json.dumps({"mods": [entry(id="late")]}).encode()
 
         response.__enter__.return_value.read.side_effect = switch_then_read
-        with mock.patch.object(vault, "http_get", return_value=response):
+        with mock.patch.object(net, "http_get", return_value=response):
             self.store.check()
         self.assertEqual([item["id"] for item in self.store.items], ["one"])
 
 
 class CatalogTests(unittest.TestCase):
     def test_rejects_unsafe_entries(self):
-        self.assertIsNone(vault.normalize(entry(id="../x")))
-        self.assertIsNone(vault.normalize(entry(url="http://example.com/a.zip")))
+        self.assertIsNone(catalog.normalize(entry(id="../x")))
+        self.assertIsNone(catalog.normalize(entry(url="http://example.com/a.zip")))
         # A bad or missing hash no longer rejects the entry; verification simply degrades.
-        self.assertEqual(vault.normalize(entry(sha256="abc"))["sha256"], "")
+        self.assertEqual(catalog.normalize(entry(sha256="abc"))["sha256"], "")
 
     def test_resolves_gdrive_mirrors(self):
-        item = vault.normalize(entry(mirrors=["gdrive:abcdefghij1234"]))
-        self.assertEqual(item["urls"][1], vault.GDRIVE_URL + "abcdefghij1234")
+        item = catalog.normalize(entry(mirrors=["gdrive:abcdefghij1234"]))
+        self.assertEqual(item["urls"][1], settings.GDRIVE_URL + "abcdefghij1234")
 
     def test_target_path_uses_the_vault_format(self):
-        item = vault.normalize(entry(name="One: Two/Three", game_version="1.0.6 (kèm DLC)"))
-        path = vault.normalized_path(item["name"], item["game_version"], "Bản A")
+        item = catalog.normalize(entry(name="One: Two/Three", game_version="1.0.6 (kèm DLC)"))
+        path = names.normalized_path(item["name"], item["game_version"], "Bản A")
         self.assertEqual(path.as_posix(), "One Two Three - [Bản A]/[1.0.6-unreviewed] [Bản A].zip")
 
     def test_missing_game_version(self):
-        item = vault.normalize(entry())
-        self.assertEqual(vault.normalized_path(item["name"], item["game_version"], "VI").name,
-                         "[miss-unreviewed] [VI].zip")
+        item = catalog.normalize(entry())
+        self.assertEqual(
+            names.normalized_path(item["name"], item["game_version"], "VI").name, "[miss-unreviewed] [VI].zip"
+        )
 
 
 class ArtworkTests(unittest.TestCase):
     def test_file_names_come_from_the_game_name(self):
-        cases = {"Castlevania: Belmont's Curse": "castlevania-belmonts-curse",
-                 "Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles":
-                     "demon-slayer-kimetsu-no-yaiba-the-hinokami-chronicles",
-                 "Pokémon Đỏ": "pokemon-do"}
+        cases = {
+            "Castlevania: Belmont's Curse": "castlevania-belmonts-curse",
+            "Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles": "demon-slayer-kimetsu-no-yaiba-the-hinokami-chronicles",
+            "Pokémon Đỏ": "pokemon-do",
+        }
         for name, slug in cases.items():
-            self.assertEqual(vault.art_slug(name), slug)
+            self.assertEqual(names.art_slug(name), slug)
 
     def test_file_name_has_kind_and_a_safe_extension(self):
         item = {"id": "a", "name": "Game One", "cover": "https://x.test/a/c.JPG?v=1", "background": "https://x.test/b"}
-        self.assertEqual(vault.art_file_name(item, "cover"), "game-one-cover.jpg")
-        self.assertEqual(vault.art_file_name(item, "background"), "game-one-background.img")
+        self.assertEqual(names.art_file_name(item, "cover"), "game-one-cover.jpg")
+        self.assertEqual(names.art_file_name(item, "background"), "game-one-background.img")
 
     def test_file_name_falls_back_to_the_id(self):
         item = {"id": "a", "name": "???", "cover": "https://x.test/c.png"}
-        self.assertEqual(vault.art_file_name(item, "cover"), "a-cover.png")
+        self.assertEqual(names.art_file_name(item, "cover"), "a-cover.png")
 
 
 class RepackTests(unittest.TestCase):
@@ -204,7 +218,7 @@ class RepackTests(unittest.TestCase):
 
     def repacked(self, names):
         target = self.dir / "out.zip"
-        vault.repack(self.zip_with(names), target, TITLE)
+        zips.repack(self.zip_with(names), target, TITLE)
         return zipfile.ZipFile(target)
 
     def test_layouts_all_become_contents_title_id(self):
@@ -212,8 +226,10 @@ class RepackTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 sep = "\\" if "\\" in prefix else "/"
                 result = self.repacked([f"{prefix}{TITLE}{sep}romfs{sep}a.bin"])
-                self.assertEqual(result.namelist(), ["contents/", f"contents/{TITLE}/", f"contents/{TITLE}/romfs/",
-                                                     f"contents/{TITLE}/romfs/a.bin"])
+                self.assertEqual(
+                    result.namelist(),
+                    ["contents/", f"contents/{TITLE}/", f"contents/{TITLE}/romfs/", f"contents/{TITLE}/romfs/a.bin"],
+                )
 
     def test_files_use_deflate_and_keep_content(self):
         result = self.repacked([f"{TITLE}/romfs/a.bin"])
@@ -226,22 +242,29 @@ class RepackTests(unittest.TestCase):
         self.assertEqual([n for n in result.namelist() if not n.endswith("/")], [f"contents/{TITLE}/romfs/a"])
 
     def test_rejects_unexpected_layouts(self):
-        cases = {"traversal": [f"{TITLE}/../../evil"], "other title": ["0100000000000001/romfs/a"],
-                 "stray file": ["romfs/a.bin"], "nothing": ["x.txt"],
-                 "case clash": [f"a/{TITLE}/romfs/F", f"b/{TITLE}/romfs/f"]}
+        cases = {
+            "traversal": [f"{TITLE}/../../evil"],
+            "other title": ["0100000000000001/romfs/a"],
+            "stray file": ["romfs/a.bin"],
+            "nothing": ["x.txt"],
+            "case clash": [f"a/{TITLE}/romfs/F", f"b/{TITLE}/romfs/f"],
+        }
         for name, members in cases.items():
             with self.subTest(name):
                 target = self.dir / "out.zip"
                 with self.assertRaises(RuntimeError):
-                    vault.repack(self.zip_with(members), target, TITLE)
+                    zips.repack(self.zip_with(members), target, TITLE)
                 self.assertFalse(target.exists())
 
 
 class FlexibleCatalogTests(unittest.TestCase):
     def test_heuristic_reads_alternative_keys(self):
-        raw = {"games": [{"title": "Trò Chơi", "download": "https://x.test/a.zip",
-                          "phien_ban": "1.2", "the_loai": ["RPG"]}]}
-        item = vault.parse_catalog(raw)[0]
+        raw = {
+            "games": [
+                {"title": "Trò Chơi", "download": "https://x.test/a.zip", "phien_ban": "1.2", "the_loai": ["RPG"]}
+            ]
+        }
+        item = catalog.parse_catalog(raw)[0]
         self.assertEqual(item["name"], "Trò Chơi")
         self.assertEqual(item["urls"], ["https://x.test/a.zip"])
         self.assertEqual(item["version"], "1.2")
@@ -249,29 +272,32 @@ class FlexibleCatalogTests(unittest.TestCase):
         self.assertEqual(item["id"], "tro-choi")  # derived from the name when no id is given
 
     def test_top_level_list_is_a_catalog(self):
-        self.assertEqual(len(vault.parse_catalog([{"name": "A", "url": "https://x.test/a.zip"}])), 1)
+        self.assertEqual(len(catalog.parse_catalog([{"name": "A", "url": "https://x.test/a.zip"}])), 1)
 
     def test_nested_file_fields(self):
-        raw = {"mods": [{"id": "g", "name": "G",
-                         "files": [{"url": "https://x.test/a.zip", "sha256": "a" * 64, "size": 10}]}]}
-        item = vault.parse_catalog(raw)[0]
+        raw = {
+            "mods": [
+                {"id": "g", "name": "G", "files": [{"url": "https://x.test/a.zip", "sha256": "a" * 64, "size": 10}]}
+            ]
+        }
+        item = catalog.parse_catalog(raw)[0]
         self.assertEqual((item["urls"], item["sha256"], item["size"]), (["https://x.test/a.zip"], "a" * 64, 10))
 
     def test_manual_mapping_overrides_everything(self):
         raw = {"payload": [{"slug": "pack1", "tenGame": "Game", "tai": "https://x.test/a.zip"}]}
         mapping = {"__root__": "payload", "id": "slug", "name": "tenGame", "url": "tai"}
-        item = vault.parse_catalog(raw, mapping)[0]
+        item = catalog.parse_catalog(raw, mapping)[0]
         self.assertEqual((item["id"], item["name"], item["urls"]), ("pack1", "Game", ["https://x.test/a.zip"]))
 
     def test_size_accepts_a_formatted_string(self):
-        self.assertEqual(vault.normalize({"id": "g", "url": "https://x.test/a.zip", "size": "1,234"})["size"], 1234)
+        self.assertEqual(catalog.normalize({"id": "g", "url": "https://x.test/a.zip", "size": "1,234"})["size"], 1234)
 
     def test_optional_fields_default_safely(self):
-        item = vault.normalize({"id": "g", "url": "https://x.test/a.zip"})
+        item = catalog.normalize({"id": "g", "url": "https://x.test/a.zip"})
         self.assertEqual((item["sha256"], item["size"], item["title_id"]), ("", 0, ""))
 
     def test_clean_mapping_drops_blanks(self):
-        self.assertEqual(vault.clean_mapping({"id": " slug ", "name": "", "url": None}), {"id": "slug"})
+        self.assertEqual(catalog.clean_mapping({"id": " slug ", "name": "", "url": None}), {"id": "slug"})
 
 
 class VersionFallbackTests(unittest.TestCase):
@@ -279,9 +305,10 @@ class VersionFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             store = vault.Vault(folder)
             store.set_mod_name("VI")
-            item = vault.normalize({"id": "g", "name": "G", "url": "https://x.test/a.zip",
-                                    "mod_version": "1.0", "title_id": TITLE})
-            target = store.root / vault.normalized_path(item["name"], item["game_version"], "VI")
+            item = catalog.normalize(
+                {"id": "g", "name": "G", "url": "https://x.test/a.zip", "mod_version": "1.0", "title_id": TITLE}
+            )
+            target = store.root / names.normalized_path(item["name"], item["game_version"], "VI")
             target.parent.mkdir(parents=True)
             target.write_bytes(b"zip")
             store._commit(item, target)
@@ -303,7 +330,7 @@ class NormalizeTests(unittest.TestCase):
         self.src.mkdir()
         self.store = vault.Vault(self.base / "data")
         self.store.set_mod_name("VI")
-        offline = mock.patch.object(vault, "http_get", side_effect=OSError("offline"))
+        offline = mock.patch.object(net, "http_get", side_effect=OSError("offline"))
         offline.start()
         self.addCleanup(offline.stop)
 
@@ -330,7 +357,7 @@ class NormalizeTests(unittest.TestCase):
             return [info.filename for info in archive.infolist() if not info.is_dir()]
 
     def test_finds_every_supported_structure(self):
-        self.zip_file(f"a/One v1.2 [VI].zip", {f"atmosphere/contents/{TITLE}/romfs/a.bin": b"1"})
+        self.zip_file("a/One v1.2 [VI].zip", {f"atmosphere/contents/{TITLE}/romfs/a.bin": b"1"})
         self.loose(f"Two/atmosphere/contents/{OTHER_TITLE}/romfs/a.bin")
         self.loose("Three/contents/0100BBBB00000000/exefs/main")
         self.loose("deep/er/Four/0100CCCC00000000/romfs/a.bin")
@@ -340,7 +367,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(found["Two"]["target"], self.dest / "Two - [VI]" / "[miss-unreviewed] [VI].zip")
 
     def test_moves_a_zip_into_the_vault_layout(self):
-        source = self.zip_file(f"pack/Game 1.0.0.zip", {f"x/{TITLE.lower()}/romfs/a.bin": b"1", "readme.txt": b"hi"})
+        source = self.zip_file("pack/Game 1.0.0.zip", {f"x/{TITLE.lower()}/romfs/a.bin": b"1", "readme.txt": b"hi"})
         self.scan()
         self.store.normalize_mods()
         target = self.dest / "Game - [VI]" / "[1.0.0-unreviewed] [VI].zip"
@@ -360,19 +387,19 @@ class NormalizeTests(unittest.TestCase):
         self.assertFalse((self.src / "Game").exists())
 
     def test_catalog_names_the_title(self):
-        known = {TITLE: vault.normalize(entry(name="Catalog Name", game_version="2.0.0"))}
+        known = {TITLE: catalog.normalize(entry(name="Catalog Name", game_version="2.0.0"))}
         self.zip_file("bad name 9.9.zip", {f"{TITLE}/romfs/a.bin": b"1"})
-        plan = vault.plan_mods(self.src, self.dest, known, {}, "VI")[0]
+        plan = normalizer.plan_mods(self.src, self.dest, known, {}, "VI")[0]
         self.assertEqual(plan["target"], self.dest / "Catalog Name - [VI]" / "[2.0.0-unreviewed] [VI].zip")
 
     def test_title_database_names_the_game_and_the_mod_comes_from_the_user(self):
-        known = {TITLE: vault.normalize(entry(name="Catalog Name"))}
+        known = {TITLE: catalog.normalize(entry(name="Catalog Name"))}
         self.zip_file("bad name.zip", {f"{TITLE}/romfs/a.bin": b"1"})
-        plan = vault.plan_mods(self.src, self.dest, known, {TITLE: "Real: Game™"}, "Bản dịch A")[0]
+        plan = normalizer.plan_mods(self.src, self.dest, known, {TITLE: "Real: Game™"}, "Bản dịch A")[0]
         self.assertEqual(plan["target"], self.dest / "Real Game - [Bản dịch A]" / "[miss-unreviewed] [Bản dịch A].zip")
 
     def test_update_title_uses_the_base_game_name(self):
-        self.assertEqual(vault.title_name({"0100BA4026E94000": "Game"}, "0100BA4026E94800"), "Game")
+        self.assertEqual(names.title_name({"0100BA4026E94000": "Game"}, "0100BA4026E94800"), "Game")
 
     def test_requires_a_mod_name(self):
         self.store.set_mod_name(" / ")
@@ -396,7 +423,7 @@ class NormalizeTests(unittest.TestCase):
     def test_failed_mod_counts_as_passed_on_the_overall_bar(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1" * 1000})
         self.scan()
-        with mock.patch.object(vault, "repack", side_effect=OSError("disk full")):
+        with mock.patch.object(zips, "repack", side_effect=OSError("disk full")):
             self.store.normalize_mods()
         self.assertEqual(self.store.normalize_job["bytes_done"], 1000)
 
@@ -420,7 +447,7 @@ class NormalizeTests(unittest.TestCase):
 
     def destination_item(self):
         self.store.set_download_dir(str(self.base / "mine"))
-        return vault.normalize(entry(name="Game", sha256="a" * 64, game_version="1.0"))
+        return catalog.normalize(entry(name="Game", sha256="a" * 64, game_version="1.0"))
 
     def test_destination_decides_the_status(self):
         item = self.destination_item()
@@ -444,7 +471,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(self.store.status_of(dict(item, game_version="2.0")), "update")
 
     def test_default_folder_works_like_a_destination(self):
-        item = vault.normalize(entry(name="Game", sha256="a" * 64, game_version="1.0"))
+        item = catalog.normalize(entry(name="Game", sha256="a" * 64, game_version="1.0"))
         self.assertEqual(self.store.status_of(item), "missing")
         target = self.place(item)
         self.store._commit(item, target)
@@ -496,32 +523,34 @@ class NormalizeTests(unittest.TestCase):
         self.store.enqueue([item["id"]])
         real_get = self.store.queue.get
         calls = iter([real_get])
+
         def next_entry():
             step = next(calls, None)
             if step is None:
                 raise SystemExit
             return step()
+
         with mock.patch.object(self.store.queue, "get", side_effect=next_entry), self.assertRaises(SystemExit):
             self.store.worker()
         return "\n".join(line for _, line in self.store.snapshot()["log"])
 
     def test_download_log_follows_a_download(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
-        item = vault.normalize(entry(name="Game", sha256=""))
+        item = catalog.normalize(entry(name="Game", sha256=""))
         with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"):
             text = self.run_worker(item)
         for expected in ("hàng đợi", "bắt đầu tải", "đang đóng gói", "đã lưu"):
             self.assertIn(expected, text)
 
     def test_download_log_keeps_retries_and_the_failure(self):
-        item = vault.normalize(entry(name="Game", sha256="a" * 64))
-        with mock.patch.object(vault.time, "sleep"):
+        item = catalog.normalize(entry(name="Game", sha256="a" * 64))
+        with mock.patch.object(time, "sleep"):
             text = self.run_worker(item)
-        self.assertEqual(text.count("lỗi tải"), vault.RETRIES)
+        self.assertEqual(text.count("lỗi tải"), settings.RETRIES)
         self.assertIn("Game: lỗi: offline", text)
 
     def test_logs_use_the_clean_game_name(self):
-        self.store.items = [vault.normalize(entry(name="Game: It's"))]
+        self.store.items = [catalog.normalize(entry(name="Game: It's"))]
         self.store.enqueue(["game"])
         self.assertIn("Game Its: đã thêm", self.store.snapshot()["log"][-1][1])
         self.zip_file("Game's Pack.zip", {f"{TITLE}/romfs/a.bin": b"1"})
@@ -540,11 +569,11 @@ class NormalizeTests(unittest.TestCase):
     def test_download_log_marks_saved_files(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
         with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"):
-            self.run_worker(vault.normalize(entry(name="Game", sha256="")))
+            self.run_worker(catalog.normalize(entry(name="Game", sha256="")))
         self.assertEqual(self.store.snapshot()["log"][-1][0], "ok")
 
     def test_stop_all_cancels_every_download(self):
-        items = [vault.normalize(entry(id=name, name=name)) for name in ("a", "b")]
+        items = [catalog.normalize(entry(id=name, name=name)) for name in ("a", "b")]
         self.store.items = items
         self.store.enqueue(["a", "b"])
         self.store.cancel_all()
@@ -552,22 +581,22 @@ class NormalizeTests(unittest.TestCase):
 
     def test_downloads_use_the_title_database_name(self):
         self.store.titles = {TITLE: "Real Game™"}
-        item = self.store._named([vault.normalize(entry(name="Catalog Name"))])[0]
+        item = self.store._named([catalog.normalize(entry(name="Catalog Name"))])[0]
         self.assertEqual((item["name"], item["catalog_name"]), ("Real Game", "Catalog Name"))
 
     def test_unknown_title_keeps_the_catalog_name(self):
-        item = self.store._named([vault.normalize(entry(name="Catalog Name"))])[0]
+        item = self.store._named([catalog.normalize(entry(name="Catalog Name"))])[0]
         self.assertEqual(item["name"], "Catalog Name")
 
     def test_refresh_renames_loaded_games(self):
-        self.store.items = [vault.normalize(entry(name="Catalog Name"))]
+        self.store.items = [catalog.normalize(entry(name="Catalog Name"))]
         with mock.patch.object(self.store, "title_names", return_value={TITLE: "Real"}):
             self.store.refresh_titles()
         self.assertEqual(self.store.items[0]["name"], "Real")
 
     def test_destination_still_finds_a_save_under_the_catalog_name(self):
         self.store.set_download_dir(str(self.base / "mine"))
-        item = vault.normalize(entry(name="Catalog Name", sha256="a" * 64))
+        item = catalog.normalize(entry(name="Catalog Name", sha256="a" * 64))
         old = self.store.root / "Catalog Name - [VI]" / "[miss-unreviewed] [VI].zip"
         old.parent.mkdir(parents=True)
         old.write_bytes(b"zip")
@@ -582,25 +611,37 @@ class NormalizeTests(unittest.TestCase):
         self.assertFalse(old.parent.exists())
 
     def test_game_names_lose_special_characters(self):
-        for raw, expected in (("One Piece: Grand Gourmet", "One Piece Grand Gourmet"),
-                              ("Castlevania: Belmont's Curse", "Castlevania Belmonts Curse"),
-                              ("Fate/Stay Night", "Fate Stay Night"), ("Ori & the Blind Forest", "Ori the Blind Forest"),
-                              ("Mario Kart™ 8 Deluxe!", "Mario Kart 8 Deluxe"), ("Spider-Man", "Spider-Man"),
-                              ("Trò Chơi Việt", "Tro Choi Viet"), ("Pokémon Legends Z-A", "Pokemon Legends Z-A"),
-                              ("ドラゴンクエスト", "ドラゴンクエスト"), ("!!!", "!!!")):
-            self.assertEqual(vault.clean_game_name(raw), expected)
+        for raw, expected in (
+            ("One Piece: Grand Gourmet", "One Piece Grand Gourmet"),
+            ("Castlevania: Belmont's Curse", "Castlevania Belmonts Curse"),
+            ("Fate/Stay Night", "Fate Stay Night"),
+            ("Ori & the Blind Forest", "Ori the Blind Forest"),
+            ("Mario Kart™ 8 Deluxe!", "Mario Kart 8 Deluxe"),
+            ("Spider-Man", "Spider-Man"),
+            ("Trò Chơi Việt", "Tro Choi Viet"),
+            ("Pokémon Legends Z-A", "Pokemon Legends Z-A"),
+            ("ドラゴンクエスト", "ドラゴンクエスト"),
+            ("!!!", "!!!"),
+        ):
+            self.assertEqual(names.clean_game_name(raw), expected)
 
     def test_all_capitals_names_become_title_case(self):
-        for raw, expected in (("OCTOPATH TRAVELER 0", "Octopath Traveler 0"), ("SPIDER-MAN", "Spider-Man"),
-                              ("FINAL FANTASY VII", "Final Fantasy VII"),
-                              ("ĐẠI CHIẾN", "Dai Chien"), ("SUPER MARIO 3D WORLD", "Super Mario 3D World"),
-                              ("Mario KART 8", "Mario KART 8"), ("ドラゴン", "ドラゴン"),
-                              (TITLE, TITLE), (f"PACK {TITLE}", f"Pack {TITLE}")):
-            self.assertEqual(vault.clean_game_name(raw), expected)
+        for raw, expected in (
+            ("OCTOPATH TRAVELER 0", "Octopath Traveler 0"),
+            ("SPIDER-MAN", "Spider-Man"),
+            ("FINAL FANTASY VII", "Final Fantasy VII"),
+            ("ĐẠI CHIẾN", "Dai Chien"),
+            ("SUPER MARIO 3D WORLD", "Super Mario 3D World"),
+            ("Mario KART 8", "Mario KART 8"),
+            ("ドラゴン", "ドラゴン"),
+            (TITLE, TITLE),
+            (f"PACK {TITLE}", f"Pack {TITLE}"),
+        ):
+            self.assertEqual(names.clean_game_name(raw), expected)
 
     def test_finds_a_save_from_before_accents_were_removed(self):
         self.store.set_download_dir(str(self.base / "mine"))
-        item = vault.normalize(entry(name="Pokémon Game", sha256="a" * 64))
+        item = catalog.normalize(entry(name="Pokémon Game", sha256="a" * 64))
         old = self.store.root / "Pokémon Game - [VI]" / "[miss-unreviewed] [VI].zip"
         old.parent.mkdir(parents=True)
         old.write_bytes(b"zip")
@@ -608,25 +649,25 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(self.store.status_of(item), "ok")
 
     def test_both_tabs_save_under_the_clean_name(self):
-        path = vault.normalized_path("Castlevania: Belmont's Curse", "1.1.0", "VI")
+        path = names.normalized_path("Castlevania: Belmont's Curse", "1.1.0", "VI")
         self.assertEqual(path.as_posix(), "Castlevania Belmonts Curse - [VI]/[1.1.0-unreviewed] [VI].zip")
 
     def test_finds_and_replaces_a_save_from_before_names_were_cleaned(self):
         self.store.set_download_dir(str(self.base / "mine"))
-        item = vault.normalize(entry(name="Castlevania: Belmont's Curse", sha256="a" * 64))
+        item = catalog.normalize(entry(name="Castlevania: Belmont's Curse", sha256="a" * 64))
         old = self.store.root / "Castlevania Belmont's Curse - [VI]" / "[miss-unreviewed] [VI].zip"
         old.parent.mkdir(parents=True)
         old.write_bytes(b"zip")
         self.store._commit(item, old)
         self.assertEqual(self.store.status_of(item), "ok")
-        new = self.store.root / vault.normalized_path(item["name"], item["game_version"], "VI")
+        new = self.store.root / names.normalized_path(item["name"], item["game_version"], "VI")
         new.parent.mkdir(parents=True)
         new.write_bytes(b"zip")
         self.store._commit(item, new)
         self.assertFalse(old.parent.exists())
 
     def queue_two(self, sizes=(100, 300)):
-        self.store.items = [vault.normalize(entry(id=name, name=name, size=size)) for name, size in zip("ab", sizes)]
+        self.store.items = [catalog.normalize(entry(id=name, name=name, size=size)) for name, size in zip("ab", sizes)]
         self.store.enqueue(["a", "b"])
 
     def test_overall_progress_counts_running_and_finished_bytes(self):
@@ -661,12 +702,12 @@ class NormalizeTests(unittest.TestCase):
     def test_batch_counts_how_each_download_ended(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
         with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"):
-            self.run_worker(vault.normalize(entry(name="Game", sha256="")))
+            self.run_worker(catalog.normalize(entry(name="Game", sha256="")))
         self.assertEqual(self.store.batch_progress()["saved"], 1)
         with mock.patch.object(self.store, "_download", side_effect=OSError("offline")):
-            self.run_worker(vault.normalize(entry(id="two", name="Two", sha256="")))
-        with mock.patch.object(self.store, "_download", side_effect=vault.Cancelled):
-            self.run_worker(vault.normalize(entry(id="three", name="Three", sha256="")))
+            self.run_worker(catalog.normalize(entry(id="two", name="Two", sha256="")))
+        with mock.patch.object(self.store, "_download", side_effect=zips.Cancelled):
+            self.run_worker(catalog.normalize(entry(id="three", name="Three", sha256="")))
         progress = self.store.batch_progress()
         self.assertEqual((progress["failed"], progress["cancelled"]), (0, 1))
 
@@ -683,28 +724,28 @@ class NormalizeTests(unittest.TestCase):
 
     def test_downloads_use_the_same_mod_name(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
-        item = vault.normalize(entry(name="Game", sha256="", game_version="1.0"))
+        item = catalog.normalize(entry(name="Game", sha256="", game_version="1.0"))
         self.store.items = [item]
         self.store.enqueue([item["id"]])
-        with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"), \
-                mock.patch.object(self.store, "_commit", side_effect=SystemExit):
-            with self.assertRaises(SystemExit):
-                self.store.worker()
+        with mock.patch.object(self.store, "_download", return_value=self.src / "Game.zip"), mock.patch.object(
+            self.store, "_commit", side_effect=SystemExit
+        ), self.assertRaises(SystemExit):
+            self.store.worker()
         self.assertTrue((self.store.root / "Game - [VI]" / "[1.0-unreviewed] [VI].zip").exists())
 
     def test_title_database_is_cached(self):
         raw = json.dumps({"1": {"id": TITLE.lower(), "name": "Game"}, "2": {"id": None, "name": "x"}}).encode()
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = raw
-        with mock.patch.object(vault, "http_get", return_value=response) as get:
+        with mock.patch.object(net, "http_get", return_value=response) as get:
             self.assertEqual(self.store.title_names(), {TITLE: "Game"})
             self.assertEqual(self.store.title_names(), {TITLE: "Game"})
         self.assertEqual(get.call_count, 1)
 
     def test_old_title_database_survives_a_failed_refresh(self):
-        path = self.store.catalogs_dir / vault.TITLES_FILE
+        path = self.store.catalogs_dir / settings.TITLES_FILE
         path.write_text(json.dumps({TITLE: "Game"}), encoding="utf-8")
-        vault.os.utime(path, (1, 1))
+        os.utime(path, (1, 1))
         self.assertEqual(self.store.title_names(), {TITLE: "Game"})
 
     def test_uses_deflate_level_nine(self):
@@ -738,14 +779,18 @@ class NormalizeTests(unittest.TestCase):
         self.assertTrue(second.exists())
 
     def test_pack_with_a_font_title_stays_one_zip_named_after_the_game(self):
-        source = self.zip_file("Pack.zip", {f"atmosphere/contents/{FONT_TITLE}/romfs/f.ttf": b"1",
-                                            f"atmosphere/contents/{TITLE}/romfs/a.bin": b"2"})
+        source = self.zip_file(
+            "Pack.zip",
+            {f"atmosphere/contents/{FONT_TITLE}/romfs/f.ttf": b"1", f"atmosphere/contents/{TITLE}/romfs/a.bin": b"2"},
+        )
         with mock.patch.object(self.store, "title_names", return_value={TITLE: "Real Game"}):
             plans = self.scan()
         self.assertEqual((len(plans), plans[0]["title_id"], plans[0]["extra_titles"]), (1, TITLE, 1))
         self.store.normalize_mods()
-        self.assertEqual(sorted(self.names(self.dest / "Real Game - [VI]" / "[miss-unreviewed] [VI].zip")),
-                         sorted([f"contents/{TITLE}/romfs/a.bin", f"contents/{FONT_TITLE}/romfs/f.ttf"]))
+        self.assertEqual(
+            sorted(self.names(self.dest / "Real Game - [VI]" / "[miss-unreviewed] [VI].zip")),
+            sorted([f"contents/{TITLE}/romfs/a.bin", f"contents/{FONT_TITLE}/romfs/f.ttf"]),
+        )
         self.assertFalse(source.exists())
 
     def test_loose_pack_stays_one_zip_and_leaves_nothing_behind(self):
@@ -763,16 +808,17 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(len(self.scan()), 2)
 
     def test_two_game_titles_with_one_known_use_the_known_one(self):
-        self.assertEqual(vault.main_title([OTHER_TITLE, TITLE], {TITLE: "Game"}, {}), TITLE)
-        self.assertEqual(vault.main_title([FONT_TITLE, OTHER_TITLE], {}, {}), OTHER_TITLE)
-        self.assertEqual(vault.main_title([FONT_TITLE], {}, {}), FONT_TITLE)
+        self.assertEqual(normalizer.main_title([OTHER_TITLE, TITLE], {TITLE: "Game"}, {}), TITLE)
+        self.assertEqual(normalizer.main_title([FONT_TITLE, OTHER_TITLE], {}, {}), OTHER_TITLE)
+        self.assertEqual(normalizer.main_title([FONT_TITLE], {}, {}), FONT_TITLE)
 
     def test_ignores_everything_outside_the_title_folder(self):
         self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1", "switch/tool.nro": b"2", "manifest.json": b"{}"})
         self.scan()
         self.store.normalize_mods()
-        self.assertEqual(self.names(self.dest / "Game - [VI]" / "[miss-unreviewed] [VI].zip"),
-                         [f"contents/{TITLE}/romfs/a.bin"])
+        self.assertEqual(
+            self.names(self.dest / "Game - [VI]" / "[miss-unreviewed] [VI].zip"), [f"contents/{TITLE}/romfs/a.bin"]
+        )
 
     def test_deletes_the_outermost_folder(self):
         self.zip_file("outer/inner/Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
@@ -802,14 +848,18 @@ class NormalizeTests(unittest.TestCase):
     def test_keeps_the_source_when_writing_fails(self):
         source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
         self.scan()
-        with mock.patch.object(vault, "repack", side_effect=OSError("disk full")):
+        with mock.patch.object(zips, "repack", side_effect=OSError("disk full")):
             self.store.normalize_mods()
         self.assertEqual(self.store.normalize_job["plans"][0]["status"], "error")
         self.assertTrue(source.exists())
 
     def test_rejects_nested_or_missing_folders(self):
-        for source, dest in ((self.src, self.src), (self.src, self.src / "out"),
-                             (self.base / "nope", self.dest), ("", self.dest)):
+        for source, dest in (
+            (self.src, self.src),
+            (self.src, self.src / "out"),
+            (self.base / "nope", self.dest),
+            ("", self.dest),
+        ):
             self.store.scan_mods(str(source), str(dest))
             self.assertTrue(self.store.normalize_job["failed"], (source, dest))
 
@@ -846,7 +896,7 @@ class NormalizeTests(unittest.TestCase):
     def test_failed_backup_is_reported_and_keeps_the_source(self):
         source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
         self.scan()
-        with mock.patch.object(vault.shutil, "move", side_effect=OSError("full")):
+        with mock.patch.object(shutil, "move", side_effect=OSError("full")):
             self.store.normalize_mods()
         self.assertTrue(source.exists())
         self.assertIn("backup", self.store.normalize_job["plans"][0]["message"])
@@ -857,18 +907,22 @@ class NormalizeTests(unittest.TestCase):
         self.store.set_mod_name("Khác")
         plans = self.scan()
         self.assertEqual([plan["status"] for plan in plans], ["ready", "ready"])
-        self.assertEqual({plan["target"] for plan in plans},
-                         {self.dest / "Game - [60FPS]" / "[1.1.1-v262144] [60FPS].zip",
-                          self.dest / "Game - [VI]" / "[1.1.1-v262144] [VI].zip"})
+        self.assertEqual(
+            {plan["target"] for plan in plans},
+            {
+                self.dest / "Game - [60FPS]" / "[1.1.1-v262144] [60FPS].zip",
+                self.dest / "Game - [VI]" / "[1.1.1-v262144] [VI].zip",
+            },
+        )
 
     def test_keeps_the_internal_version_a_source_gives(self):
-        version = vault.internal_version
+        version = normalizer.internal_version
         self.assertEqual(version("zip", self.src / "[v1.6.15-v1310720] [VI].zip", self.src, "v1.6.15"), "v1310720")
         self.assertEqual(version("zip", self.src / "[1.1.1-v262144]/Mod.zip", self.src, "1.1.1"), "v262144")
         self.assertEqual(version("zip", self.src / "[v1.1.0-v65536] [VI].zip", self.src, "1.1.0"), "v65536")
 
     def test_internal_version_falls_back_to_unreviewed(self):
-        version = vault.internal_version
+        version = normalizer.internal_version
         self.assertEqual(version("zip", self.src / "Game 1.0.zip", self.src, "1.0"), "unreviewed")
         self.assertEqual(version("zip", self.src / "[1.1.1-v262144] [VI].zip", self.src, "2.0"), "unreviewed")
 
@@ -883,13 +937,17 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(self.store.status_of(item), "ok")
 
     def test_reads_the_mod_name_from_a_source(self):
-        name = vault.source_mod_name
-        for kind, relative, expected in (("zip", "a/[1.0-v1] [60FPS].zip", "60FPS"),
-                                         ("zip", "[VI-Characters] Stardew valley/[v1.6-v2] x.zip", "VI-Characters"),
-                                         ("zip", "Game - [Bản A]/x.zip", "Bản A"),
-                                         ("folder", f"[60FPS] - Game/atmosphere/contents/{TITLE}", "60FPS"),
-                                         ("zip", "[1.0.0-unreviewed].zip", ""), ("zip", "[miss-unreviewed].zip", ""),
-                                         ("zip", "[Pokemon]/Game.zip", ""), ("zip", "Game.zip", "")):
+        name = normalizer.source_mod_name
+        for kind, relative, expected in (
+            ("zip", "a/[1.0-v1] [60FPS].zip", "60FPS"),
+            ("zip", "[VI-Characters] Stardew valley/[v1.6-v2] x.zip", "VI-Characters"),
+            ("zip", "Game - [Bản A]/x.zip", "Bản A"),
+            ("folder", f"[60FPS] - Game/atmosphere/contents/{TITLE}", "60FPS"),
+            ("zip", "[1.0.0-unreviewed].zip", ""),
+            ("zip", "[miss-unreviewed].zip", ""),
+            ("zip", "[Pokemon]/Game.zip", ""),
+            ("zip", "Game.zip", ""),
+        ):
             self.assertEqual(name(kind, self.src / relative, self.src), expected, relative)
 
     def test_source_without_a_name_uses_the_mod_name_field(self):
@@ -905,22 +963,29 @@ class NormalizeTests(unittest.TestCase):
     def test_cancelling_keeps_unfinished_sources(self):
         source = self.zip_file("Game.zip", {f"{TITLE}/romfs/a.bin": b"1"})
         self.scan()
-        with mock.patch.object(vault, "repack", side_effect=vault.Cancelled):
+        with mock.patch.object(zips, "repack", side_effect=zips.Cancelled):
             self.store.normalize_mods()
         self.assertEqual(self.store.normalize_job["plans"][0]["status"], "ready")
         self.assertTrue(source.exists())
 
     def test_cleans_names(self):
-        for raw, expected in (("[VI] - Game", "Game"), ("[1.0.0-unreviewed] [VI]", ""), ("Game_Name_v1.2", "Game Name"),
-                              ("Game Việt Hóa", "Game"), ("contents", ""), (TITLE, ""), ("Final Fantasy VI", "Final Fantasy VI")):
-            self.assertEqual(vault.clean_mod_name(raw), expected)
+        for raw, expected in (
+            ("[VI] - Game", "Game"),
+            ("[1.0.0-unreviewed] [VI]", ""),
+            ("Game_Name_v1.2", "Game Name"),
+            ("Game Việt Hóa", "Game"),
+            ("contents", ""),
+            (TITLE, ""),
+            ("Final Fantasy VI", "Final Fantasy VI"),
+        ):
+            self.assertEqual(names.clean_mod_name(raw), expected)
 
 
 class ReplaceDownloadTests(unittest.TestCase):
     def test_saving_survives_an_old_folder_that_is_already_gone(self):
         with tempfile.TemporaryDirectory() as folder:
             store = vault.Vault(folder)
-            item = vault.normalize(entry(name="Game", sha256="a" * 64))
+            item = catalog.normalize(entry(name="Game", sha256="a" * 64))
             store.state[item["id"]] = {"file": "Game - []/old.zip", "sha256": "b" * 64, "version": ""}
             target = store.root / "elsewhere" / "new.zip"
             target.parent.mkdir(parents=True)
@@ -934,9 +999,9 @@ class StatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             store = vault.Vault(folder)
             store.set_mod_name("VI")
-            item = vault.normalize(entry())
+            item = catalog.normalize(entry())
             self.assertEqual(store.status_of(item), "missing")
-            target = store.root / vault.normalized_path(item["name"], item["game_version"], "VI")
+            target = store.root / names.normalized_path(item["name"], item["game_version"], "VI")
             target.parent.mkdir(parents=True)
             target.write_bytes(b"repacked")
             store._commit(item, target)
@@ -952,10 +1017,10 @@ class AppUpdateTests(unittest.TestCase):
     def check(self, current, body):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = body
-        config = {vault.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
-        with tempfile.TemporaryDirectory() as folder, \
-                mock.patch.object(vault, "load_config", return_value=config), \
-                mock.patch.object(vault, "http_get", return_value=response) as get:
+        config = {settings.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            settings, "load_config", return_value=config
+        ), mock.patch.object(net, "http_get", return_value=response) as get:
             store = vault.Vault(folder)
             store.check_app_update()
         return store.app_update, get
@@ -964,42 +1029,60 @@ class AppUpdateTests(unittest.TestCase):
         return f'{{"tag_name": "{tag}", "html_url": "https://github.com/o/r/releases/tag/{tag}"}}'.encode()
 
     def test_picks_the_asset_for_this_platform(self):
-        asset = {"name": vault.asset_name(), "size": 5, "digest": "sha256:" + "a" * 64,
-                 "browser_download_url": "https://github.com/o/r/releases/download/v1/a.zip"}
+        asset = {
+            "name": system.asset_name(),
+            "size": 5,
+            "digest": "sha256:" + "a" * 64,
+            "browser_download_url": "https://github.com/o/r/releases/download/v1/a.zip",
+        }
         release = {"assets": [{"name": "other.zip"}, asset]}
-        self.assertEqual(vault.Vault.pick_asset(release),
-                         {"url": asset["browser_download_url"], "size": 5, "sha256": "a" * 64})
+        self.assertEqual(
+            vault.Vault.pick_asset(release), {"url": asset["browser_download_url"], "size": 5, "sha256": "a" * 64}
+        )
 
     def test_rejects_assets_that_cannot_be_verified(self):
-        good = {"name": vault.asset_name(), "size": 5, "digest": "sha256:" + "a" * 64,
-                "browser_download_url": "https://github.com/o/r/a.zip"}
-        for change in ({"digest": None}, {"digest": "md5:abc"}, {"size": 0}, {"size": vault.MAX_UPDATE + 1},
-                       {"browser_download_url": "https://evil.test/a.zip"}):
+        good = {
+            "name": system.asset_name(),
+            "size": 5,
+            "digest": "sha256:" + "a" * 64,
+            "browser_download_url": "https://github.com/o/r/a.zip",
+        }
+        for change in (
+            {"digest": None},
+            {"digest": "md5:abc"},
+            {"size": 0},
+            {"size": settings.MAX_UPDATE + 1},
+            {"browser_download_url": "https://evil.test/a.zip"},
+        ):
             self.assertIsNone(vault.Vault.pick_asset({"assets": [{**good, **change}]}))
         self.assertIsNone(vault.Vault.pick_asset({"assets": []}))
 
     def test_app_version(self):
-        with mock.patch.object(vault, "load_config", return_value={vault.VERSION_KEY: "v1.2.3"}):
-            self.assertEqual(vault.app_version(), "v1.2.3")
-        with mock.patch.object(vault, "load_config", return_value={vault.VERSION_KEY: ""}):
-            self.assertEqual(vault.app_version(), "dev")
+        with mock.patch.object(settings, "load_config", return_value={settings.VERSION_KEY: "v1.2.3"}):
+            self.assertEqual(settings.app_version(), "v1.2.3")
+        with mock.patch.object(settings, "load_config", return_value={settings.VERSION_KEY: ""}):
+            self.assertEqual(settings.app_version(), "dev")
 
     def test_reports_the_outcome_of_a_check(self):
-        outcomes = {("v1.0.0", self.release("v1.0.1")): "available", ("v1.0.1", self.release("v1.0.1")): "current",
-                    ("v1.0.0", b"not json"): "error", ("", self.release("v1.0.1")): "unversioned"}
+        outcomes = {
+            ("v1.0.0", self.release("v1.0.1")): "available",
+            ("v1.0.1", self.release("v1.0.1")): "current",
+            ("v1.0.0", b"not json"): "error",
+            ("", self.release("v1.0.1")): "unversioned",
+        }
         for (current, body), outcome in outcomes.items():
             response = mock.MagicMock()
             response.__enter__.return_value.read.return_value = body
-            config = {vault.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
-            with tempfile.TemporaryDirectory() as folder, \
-                    mock.patch.object(vault, "load_config", return_value=config), \
-                    mock.patch.object(vault, "http_get", return_value=response):
+            config = {settings.VERSION_KEY: current, "PATCHVAULT_RELEASES_URL": self.URL}
+            with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+                settings, "load_config", return_value=config
+            ), mock.patch.object(net, "http_get", return_value=response):
                 self.assertEqual(vault.Vault(folder).check_app_update(), outcome)
 
     def test_parses_versions(self):
-        self.assertEqual(vault.parse_version("v1.2.3"), (1, 2, 3))
+        self.assertEqual(names.parse_version("v1.2.3"), (1, 2, 3))
         for text in ("", "dev", "v1.2", "1.2.3-beta"):
-            self.assertIsNone(vault.parse_version(text))
+            self.assertIsNone(names.parse_version(text))
 
     def test_reports_a_newer_release(self):
         update, _ = self.check("v1.9.0", self.release("v1.10.0"))
@@ -1045,9 +1128,9 @@ class SelfUpdateTests(unittest.TestCase):
         response.__enter__.return_value = io.BytesIO(body)
         asset = {"url": "https://github.com/a", "size": len(body), "sha256": digest, **(asset or {})}
         store = vault.Vault(self.dir)
-        with mock.patch.object(vault, "http_get", return_value=response), \
-                mock.patch.object(vault, "program_path", return_value=self.program), \
-                mock.patch.object(vault.sys, "platform", "linux"):
+        with mock.patch.object(net, "http_get", return_value=response), mock.patch.object(
+            system, "program_path", return_value=self.program
+        ), mock.patch.object(sys, "platform", "linux"):
             store.install_app_update({"asset": asset})
         return store.app_update_job
 
@@ -1055,7 +1138,7 @@ class SelfUpdateTests(unittest.TestCase):
         job = self.install(self.release_zip())
         self.assertEqual(job["phase"], "done")
         self.assertEqual(self.program.read_bytes(), b"new program")
-        self.assertEqual(vault.backup_path(self.program).read_bytes(), b"old program")
+        self.assertEqual(system.backup_path(self.program).read_bytes(), b"old program")
         self.assertEqual(self.data.read_bytes(), b"my data")
 
     def test_new_program_is_executable(self):
@@ -1067,7 +1150,7 @@ class SelfUpdateTests(unittest.TestCase):
         job = self.install(self.release_zip(), {"sha256": "0" * 64})
         self.assertEqual(job["phase"], "error")
         self.assertEqual(self.program.read_bytes(), b"old program")
-        self.assertFalse(vault.backup_path(self.program).exists())
+        self.assertFalse(system.backup_path(self.program).exists())
 
     def test_oversized_download_is_stopped(self):
         job = self.install(self.release_zip(), {"size": 3})
@@ -1082,16 +1165,17 @@ class SelfUpdateTests(unittest.TestCase):
     def test_failed_swap_restores_the_old_program(self):
         new = self.dir / "new"
         new.write_bytes(b"new")
-        with mock.patch.object(vault.shutil, "move", side_effect=OSError("disk full")), self.assertRaises(OSError):
-            vault.swap_program(new, self.program)
+        with mock.patch.object(shutil, "move", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            system.swap_program(new, self.program)
         self.assertEqual(self.program.read_bytes(), b"old program")
 
     def test_next_start_removes_the_backup(self):
-        backup = vault.backup_path(self.program)
+        backup = system.backup_path(self.program)
         backup.write_bytes(b"old")
-        with mock.patch.object(vault.sys, "frozen", True, create=True), \
-                mock.patch.object(vault, "program_path", return_value=self.program):
-            vault.remove_old_program()
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
+            system, "program_path", return_value=self.program
+        ):
+            system.remove_old_program()
         self.assertFalse(backup.exists())
 
     def test_work_files_are_removed(self):
@@ -1099,30 +1183,31 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertFalse((self.dir / ".parts" / "app-update").exists())
 
     def test_only_frozen_builds_with_an_asset_self_update(self):
-        self.assertFalse(vault.can_self_update({"asset": {"url": "x"}}))
-        with mock.patch.object(vault.sys, "frozen", True, create=True), \
-                mock.patch.object(vault, "program_path", return_value=self.program):
-            self.assertTrue(vault.can_self_update({"asset": {"url": "x"}}))
-            self.assertFalse(vault.can_self_update({"asset": None}))
+        self.assertFalse(system.can_self_update({"asset": {"url": "x"}}))
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
+            system, "program_path", return_value=self.program
+        ):
+            self.assertTrue(system.can_self_update({"asset": {"url": "x"}}))
+            self.assertFalse(system.can_self_update({"asset": None}))
 
 
 class PlatformTests(unittest.TestCase):
     def frozen_base(self, platform, executable):
-        with mock.patch.object(vault.sys, "frozen", True, create=True), \
-                mock.patch.object(vault.sys, "platform", platform), \
-                mock.patch.object(vault.sys, "executable", executable), \
-                mock.patch.object(vault.os, "access", return_value=True):
-            return vault.base_dir()
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
+            sys, "platform", platform
+        ), mock.patch.object(sys, "executable", executable), mock.patch.object(os, "access", return_value=True):
+            return settings.base_dir()
 
     def test_source_runs_use_the_data_folder(self):
-        self.assertEqual(vault.base_dir(), Path(vault.__file__).resolve().parent / ".data")
+        self.assertEqual(settings.base_dir(), Path(vault.__file__).resolve().parents[1] / ".data")
 
     def test_data_sits_next_to_the_program(self):
         self.assertEqual(self.frozen_base("linux", "/opt/vault/App"), Path("/opt/vault"))
 
     def test_macos_uses_the_folder_holding_the_app(self):
-        self.assertEqual(self.frozen_base("darwin", "/Users/a/Games/App.app/Contents/MacOS/App"),
-                         Path("/Users/a/Games"))
+        self.assertEqual(
+            self.frozen_base("darwin", "/Users/a/Games/App.app/Contents/MacOS/App"), Path("/Users/a/Games")
+        )
 
     def test_macos_translocated_app_uses_application_support(self):
         result = self.frozen_base("darwin", "/private/var/AppTranslocation/X/d/App.app/Contents/MacOS/App")

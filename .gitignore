@@ -11,3 +11,5 @@ dist/
 __pycache__/
 *.py[cod]
 .venv/
+.ruff_cache/
+.mypy_cache/

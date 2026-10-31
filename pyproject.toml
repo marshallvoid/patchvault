@@ -1,0 +1,22 @@
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+extend-exclude = ["dist"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "PIE"]
+# RUF001 flags Vietnamese text, E501 is the formatter's job, and the others are style choices.
+ignore = ["E501", "RUF001", "RUF012", "SIM105"]
+
+[tool.ruff.lint.per-file-ignores]
+# These add the project root to sys.path before importing the package.
+"scripts/*" = ["E402"]
+"tests/*" = ["E402"]
+
+[tool.mypy]
+files = ["main.py", "patchvault", "scripts", "tests"]
+ignore_missing_imports = true
+check_untyped_defs = true
+# The code is not annotated, so empty containers cannot be typed where they are created.
+# Lambdas with default arguments, used for Tk callbacks, cannot be inferred either.
+disable_error_code = ["misc", "var-annotated"]

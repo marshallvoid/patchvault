@@ -73,6 +73,8 @@ Download the zip for your platform from [Releases](../../releases) and extract i
 PatchVault          # .exe on Windows, .app on macOS
 downloaded/         # finished mods
 covers/             # cached artwork
+LICENSE
+THIRD_PARTY_LICENSES.txt
 ```
 
 The app keeps its data next to itself, so the whole folder can be moved or copied.
@@ -135,9 +137,14 @@ Requires Python 3.8+ with Tkinter. Pillow is optional and enables artwork.
 make run     # open the app from source
 make check   # print available updates
 make test    # run the tests
+make lint    # check style and types with ruff and mypy
+make format  # fix style problems and format the code
 make build   # create dist/PatchVault-<platform>-<arch>.zip
 make clean   # remove build output and caches
 ```
+
+The code lives in the `patchvault/` package, and `main.py` starts it. `patchvault/ui/` holds the
+Tkinter interface, and everything else works without it.
 
 ## Releases
 
